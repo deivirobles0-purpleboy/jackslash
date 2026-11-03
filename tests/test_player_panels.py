@@ -103,6 +103,21 @@ class PanelTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("modules.adivinar", source)
         self.assertIn("intents.message_content = False", source)
 
+    def test_help_lists_only_available_slash_entry_points(self):
+        from modules.economy import (
+            NAVE_COMMAND_PAGES, NAVE_INFO_DESCRIPTION,
+            NaveHelpView, _build_nave_commands_embed,
+        )
+        self.assertEqual(len(NAVE_COMMAND_PAGES), 3)
+        self.assertIn("/consultar", NAVE_INFO_DESCRIPTION)
+        for page in range(len(NAVE_COMMAND_PAGES)):
+            embed = _build_nave_commands_embed(page)
+            self.assertLessEqual(len(embed.fields[0].value), 1024)
+            self.assertNotIn("!", embed.fields[0].value)
+            self.assertNotIn("Prefijo", embed.footer.text)
+            self.assertLessEqual(len(embed), 6000)
+        self.assertEqual(len(NaveHelpView(1).children), 4)
+
     async def test_roulette_cooldown_starts_after_settlement(self):
         from modules.roulette import Roulette
 

@@ -38,6 +38,8 @@ logger = logging.getLogger(__name__)
 NAVE_INFO_DESCRIPTION = (
     "PurpleJack es una experiencia de economía y entretenimiento donde puedes "
     "trabajar, competir, jugar, coleccionar artículos y progresar junto a la comunidad.\n\n"
+    "Comienza con `/consultar` para ver tus recursos, `/trabajar` para elegir "
+    "un empleo o `/jugar` para abrir los juegos disponibles.\n\n"
     "Antes de comenzar, consulta nuestros "
     "[Términos de Servicio](https://purplejack.online/terms.html) y nuestra "
     "[Política de Privacidad](https://purplejack.online/privacy.html) para conocer "
@@ -49,45 +51,39 @@ NAVE_INFO_DESCRIPTION = (
 
 NAVE_COMMAND_PAGES = (
     (
-        "💰 Economía",
-        "Consulta tus recursos, posiciones y tiempos dentro de PurpleJack.",
+        "💰 Economía y consultas",
+        "Consulta tus recursos y utiliza las funciones económicas de la Nave.",
         (
-            "!bal       Consulta tu balance y banco.\n"
-            "!cd        Muestra tus cooldowns activos.\n"
-            "!top       Consulta la clasificación económica.\n"
-            "!evento    Consulta el ranking del evento.\n"
-            "!collect   Reclama la recompensa de tu rol."
+            "/consultar   Panel privado: Balance, Inventario, CD,\n"
+            "             Top, Time e Info.\n"
+            "/work       Realiza una tarea y gana monedas.\n"
+            "/crime      Intenta un crimen económico.\n"
+            "/collect    Cobra las recompensas de tus roles.\n"
+            "/tienda     Abre la tienda de artículos."
         ),
     ),
     (
-        "🧰 Empleos, tienda e inventario",
-        "Trabaja, progresa y administra tus artículos.",
+        "🧰 Empleos",
+        "Gestiona tu empleo desde un único panel privado.",
         (
-            "!work      Realiza un trabajo económico básico.\n"
-            "!crime     Intenta cometer un crimen.\n"
-            "!empleos   Consulta los empleos disponibles.\n"
-            "!aplicar   Solicita un empleo.\n"
-            "!renunciar Abandona tu empleo actual.\n"
-            "!exp       Consulta tu experiencia laboral.\n"
-            "!oficina   Accede a empleos avanzados.\n"
-            "!trabajar  Cumple la jornada de tu empleo.\n"
-            "!tienda    Abre la tienda.\n"
-            "!info      Consulta un artículo.\n"
-            "!inv       Abre tu inventario.\n"
-            "!time      Consulta la duración de tus artículos."
+            "/trabajar  Abre el centro laboral.\n"
+            "  Trabajar  Inicia la jornada de tu empleo.\n"
+            "  Aplicar   Solicita un empleo.\n"
+            "  Renunciar Deja tu empleo actual.\n"
+            "  Oficina   Accede a empleos de maestría.\n"
+            "  Empleos   Muestra los trabajos disponibles.\n"
+            "  XP laboral Consulta tu progreso laboral."
         ),
     ),
     (
         "🎮 Juegos y competición",
-        "Participa en los juegos y desafíos disponibles.",
+        "Abre juegos, carreras y desafíos desde comandos slash.",
         (
-            "!dados     Juega una partida de dados.\n"
-            "!ruleta    Realiza una apuesta en la ruleta.\n"
-            "!bj        Juega Blackjack.\n"
-            "!memo      Inicia el juego de memoria.\n"
-            "!carrera   Participa en una carrera.\n"
-            "!retar     Desafía a otro jugador.\n"
-            "!rob       Intenta robar a otro miembro."
+            "/jugar {apuesta}             Ruleta, Dados, BJ y Memo.\n"
+            "/carrera {apuesta}           Convoca una carrera.\n"
+            "/retar {usuario} {apuesta}   Desafía a un jugador.\n"
+            "/rob {usuario}              Intenta robarlo.\n"
+            "Apps > Robar                Roba al autor de un mensaje."
         ),
     ),
 )
@@ -111,7 +107,7 @@ def _build_nave_commands_embed(page: int) -> discord.Embed:
         color=discord.Color.blurple(),
     )
     embed.add_field(name="Comandos disponibles", value=f"```text\n{commands_text}\n```", inline=False)
-    embed.set_footer(text=f"Página {page + 1}/{len(NAVE_COMMAND_PAGES)} · Prefijo de usuario: !")
+    embed.set_footer(text=f"Página {page + 1}/{len(NAVE_COMMAND_PAGES)} · Comandos de usuario: /")
     return embed
 
 
