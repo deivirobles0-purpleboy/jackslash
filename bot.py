@@ -1,0 +1,795 @@
+# Deployment refresh: 2026-08-17
+import discord
+from discord.ext import commands
+from discord import app_commands
+import asyncio
+import time
+import signal
+import logging
+from importlib.metadata import PackageNotFoundError, version
+from datetime import datetime, timedelta, timezone
+
+# ── LOGGING ────────────────────────────────────────────
+
+class _PurpleFormatter(logging.Formatter):
+    ICONS = {
+        logging.DEBUG:    "🔍",
+        logging.INFO:     "✔️ ",
+        logging.WARNING:  "❌",
+        logging.ERROR:    "❌",
+        logging.CRITICAL: "❌",
+    }
+
+    def format(self, record: logging.LogRecord) -> str:
+        icon = self.ICONS.get(record.levelno, "  ")
+        base = super().format(record)
+        return f"{icon} {base}"
+
+
+class _VoiceWarningFilter(logging.Filter):
+    """Suprime los warnings de PyNaCl / davey (voz no usada)."""
+    _BLOCKED = {"PyNaCl is not installed", "davey is not installed"}
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        return not any(msg in record.getMessage() for msg in self._BLOCKED)
+
+
+_handler = logging.StreamHandler()
+_handler.setFormatter(_PurpleFormatter(
+    fmt="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S"
+))
+_handler.addFilter(_VoiceWarningFilter())
+
+logging.basicConfig(level=logging.INFO, handlers=[_handler])
+
+# Aplicar filtro también al logger raíz de discord
+logging.getLogger("discord").addFilter(_VoiceWarningFilter())
+
+logger = logging.getLogger("purplejack")
+
+logger.info(f"discord.py version: {discord.__version__}")
+for package_name in ("Brotli", "brotlicffi"):
+    try:
+        logger.info("[SEGURIDAD] %s instalado: %s", package_name, version(package_name))
+    except PackageNotFoundError:
+        logger.info("[SEGURIDAD] %s no instalado", package_name)
+
+from settings import TOKEN, TEST_MODE
+try:
+    from settings import GUILD_ID
+except ImportError:
+    GUILD_ID = None
+
+from core.database import (
+    init_db, load_items_to_cache, load_cargos_to_cache,
+    load_balance_index, load_member_names, remember_member_name,
+    load_collect_config_to_cache, claim_expired_cargos,
+    get_cargo_temporal_by_id, mark_cargo_removal_failed,
+    release_cargo_claim, delete_cargo_temporal_by_id,
+    create_game_config_table, load_game_config, load_dados_config, load_memo_config,
+    load_veterano_config_to_cache, load_saboteador_config_to_cache, load_item_role_restrictions_to_cache,
+    save_collect_cooldowns, load_evento_to_cache, flush_evento_puntos,
+    recover_pending_wagers, ensure_wager_constraints,
+    get_inactive_user_ids, get_user_deletion_blocker,
+    get_user_temporary_roles, purge_user_data, touch_user_activity,
+    claim_maintenance_job, complete_maintenance_job,
+    delete_expired_failed_item_use_logs,
+)
+from core import cache
+from core.member_tenure import NEW_MEMBER_MESSAGE, has_minimum_server_tenure
+from core.halloween import init_halloween_tables
+from core.game_reminders import init_game_reminders, game_reminder_worker
+from core.config import (
+    AYUDA_CHANNEL_ID, LOG_CHANNEL_ID, STAFF_ROLE_ID, PUNISHMENT_ROLE_ID,
+    PLAYER_COMMAND_ROLE_ID,
+    LOG_CLEANUP_INTERVAL_SECONDS, LOG_MESSAGE_RETENTION_SECONDS,
+    LOG_RETENTION_CHANNEL_IDS, LOG_DELETE_DELAY_SECONDS,
+    LOG_DELETE_BATCH_SIZE, LOG_CLEANUP_BACKLOG_DELAY_SECONDS,
+)
+
+intents = discord.Intents.default()
+intents.message_content = False
+intents.members = False
+intents.messages = False
+
+async def get_prefix(bot, message):
+    """PurpleSlash no registra comandos de texto con prefijo."""
+    return []
+
+
+async def check_player_access(interaction: discord.Interaction) -> bool:
+    """Protege tanto los paneles slash como cada botón que ejecuta acciones."""
+    async def deny(message: str) -> bool:
+        if interaction.type is discord.InteractionType.autocomplete:
+            await interaction.response.autocomplete([])
+        else:
+            await interaction.response.send_message(message, ephemeral=True)
+        return False
+
+    if interaction.guild is None:
+        return await deny("Este panel solo está disponible en el servidor.")
+    if PLAYER_COMMAND_ROLE_ID not in {
+        role.id for role in getattr(interaction.user, "roles", ())
+    }:
+        return await deny(
+            "No tienes el rol necesario para usar los comandos de jugador."
+        )
+    expires_at = cache.get_active_cargo_expiry(
+        interaction.user.id, interaction.guild.id, PUNISHMENT_ROLE_ID,
+    )
+    if expires_at:
+        return await deny(
+            "Tu acceso está **Restringido**. Podrás volver a interactuar "
+            f"<t:{int(expires_at)}:R>."
+        )
+    eligible = await check_invoker_tenure(interaction.user, interaction.guild)
+    if eligible is not True:
+        return await deny(
+            NEW_MEMBER_MESSAGE if eligible is False
+            else "No pude verificar tu antigüedad. Inténtalo nuevamente."
+        )
+    return True
+
+
+async def check_invoker_tenure(user, guild) -> bool | None:
+    """No enumera miembros; consulta por ID solo si falta joined_at."""
+    if guild is None:
+        return None
+    joined_at = getattr(user, "joined_at", None)
+    if joined_at is None:
+        try:
+            member = await asyncio.wait_for(guild.fetch_member(user.id), timeout=2.0)
+            joined_at = member.joined_at
+        except (
+            asyncio.TimeoutError, discord.NotFound, discord.Forbidden,
+            discord.HTTPException, discord.ClientException,
+        ):
+            return None
+    if joined_at is None:
+        return None
+    return has_minimum_server_tenure(joined_at)
+
+
+class PurpleJackCommandTree(app_commands.CommandTree):
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        command_name = (interaction.data or {}).get("name")
+        if command_name in {
+            "jugar", "trabajar", "consultar", "work", "crime", "collect",
+            "tienda", "rob", "Robar", "carrera", "retar",
+        }:
+            return await check_player_access(interaction)
+        if command_name in {"ayuda_nave", "eliminar_mis_datos"}:
+            return True
+        eligible = await check_invoker_tenure(interaction.user, interaction.guild)
+        if eligible is True:
+            return True
+        if interaction.type is discord.InteractionType.autocomplete:
+            await interaction.response.autocomplete([])
+            return False
+        message = (
+            NEW_MEMBER_MESSAGE if eligible is False
+            else "No pude verificar tu antigüedad en el servidor. Inténtalo nuevamente."
+        )
+        await interaction.response.send_message(message, ephemeral=True)
+        return False
+
+bot = commands.Bot(
+    command_prefix=get_prefix,
+    intents=intents,
+    help_command=None,
+    member_cache_flags=discord.MemberCacheFlags.none(),
+    chunk_guilds_at_startup=False,
+    tree_cls=PurpleJackCommandTree,
+)
+
+
+@bot.event
+async def on_message(message: discord.Message) -> None:
+    """No inspecciona mensajes ni despacha los antiguos comandos con !."""
+    return
+evento_flush_task = None
+cargos_task = None
+wager_recovery_task = None
+inactive_purge_task = None
+log_cleanup_task = None
+game_reminder_task = None
+_activity_writes = {}
+bot._user_activity_writes = _activity_writes
+
+USER_INACTIVITY_RETENTION = 30 * 24 * 60 * 60
+USER_ACTIVITY_WRITE_INTERVAL = 60 * 60
+INACTIVE_PURGE_INTERVAL = 6 * 60 * 60
+LOG_CLEANUP_JOB_NAME = "discord-log-retention"
+
+
+class CommandAccessRestricted(commands.CheckFailure):
+    """Evita que un usuario castigado ejecute comandos con prefijo."""
+
+
+@bot.check
+async def block_restricted_prefix_commands(ctx: commands.Context) -> bool:
+    if ctx.guild is None:
+        return True
+
+    expires_at = cache.get_active_cargo_expiry(
+        ctx.author.id,
+        ctx.guild.id,
+        PUNISHMENT_ROLE_ID,
+    )
+    if not expires_at:
+        return True
+
+    await ctx.reply(
+        "Tu acceso está **Restringido** debido a un uso incorrecto del canal. "
+        f"Podrás volver a interactuar en <t:{int(expires_at)}:R>",
+        mention_author=False,
+        delete_after=3,
+    )
+    raise CommandAccessRestricted()
+
+
+@bot.check
+async def block_new_prefix_members(ctx: commands.Context) -> bool:
+    eligible = await check_invoker_tenure(ctx.author, ctx.guild)
+    if eligible is True:
+        return True
+    message = (
+        NEW_MEMBER_MESSAGE if eligible is False
+        else "No pude verificar tu antigüedad en el servidor. Inténtalo nuevamente."
+    )
+    await ctx.reply(message, mention_author=False)
+    raise CommandAccessRestricted()
+
+
+async def record_user_activity(user_id: int) -> None:
+    now = time.time()
+    if now - _activity_writes.get(user_id, 0) < USER_ACTIVITY_WRITE_INTERVAL:
+        return
+    _activity_writes[user_id] = now
+    try:
+        await touch_user_activity(user_id, now)
+    except Exception:
+        _activity_writes.pop(user_id, None)
+        logger.exception("No se pudo registrar actividad para el usuario %s", user_id)
+
+
+async def record_member_name(user) -> None:
+    if not isinstance(user, discord.Member):
+        return
+    try:
+        await remember_member_name(user.id, user.display_name)
+    except Exception:
+        logger.exception("No se pudo guardar el apodo del usuario %s", user.id)
+
+
+@bot.listen("on_interaction")
+async def track_interaction_activity(interaction: discord.Interaction):
+    if interaction.user and not interaction.user.bot:
+        await record_member_name(interaction.user)
+        await record_user_activity(interaction.user.id)
+
+
+async def load_modules():
+    await bot.load_extension("modules.economy")
+    await bot.load_extension("modules.basic_games")
+    await bot.load_extension("modules.staff")
+    await bot.load_extension("modules.roulette")
+    await bot.load_extension("modules.rob")
+    await bot.load_extension("modules.shop")
+    await bot.load_extension("modules.Empleos")
+    await bot.load_extension("modules.collect")
+    await bot.load_extension("modules.dados")
+    await bot.load_extension("modules.duels")
+    await bot.load_extension("modules.golpear")
+    await bot.load_extension("modules.carrera")
+    await bot.load_extension("modules.memo")
+    await bot.load_extension("modules.blackjack")
+    await bot.load_extension("modules.player_panels")
+    await bot.load_extension("modules.player_commands")
+
+
+async def _alertar_fallo_retiro_cargo(cargo: dict, error: Exception, intento: int):
+    """Avisa al Staff sin interrumpir los reintentos persistentes."""
+    try:
+        channel = bot.get_channel(LOG_CHANNEL_ID)
+        if channel is None:
+            channel = await bot.fetch_channel(LOG_CHANNEL_ID)
+        await channel.send(
+            (
+                f"<@&{STAFF_ROLE_ID}> ⚠️ No pude retirar un rol temporal vencido.\n"
+                f"Usuario: <@{cargo['user_id']}> (`{cargo['user_id']}`)\n"
+                f"Rol: <@&{cargo['rol_id']}> (`{cargo['rol_id']}`)\n"
+                f"Intento: **{intento}**\n"
+                f"Error: `{type(error).__name__}: {str(error)[:500]}`"
+            ),
+            allowed_mentions=discord.AllowedMentions(
+                everyone=False,
+                roles=True,
+                users=False,
+                replied_user=False,
+            ),
+        )
+    except Exception:
+        logger.exception(
+            "No se pudo alertar al Staff sobre el fallo del cargo temporal %s",
+            cargo["id"],
+        )
+
+
+async def _retirar_cargo_vencido(cargo: dict) -> str:
+    """
+    Retira y verifica un rol. El registro solo se elimina cuando Discord
+    confirma que el miembro ya no lo posee o cuando el recurso dejó de existir.
+    """
+    user_id = cargo["user_id"]
+    guild_id = cargo["guild_id"]
+    role_id = cargo["rol_id"]
+    role_lock = cache.get_role_assignment_lock(user_id, guild_id, role_id)
+
+    async with role_lock:
+        latest = await get_cargo_temporal_by_id(cargo["id"])
+        if latest is None:
+            return "reemplazado"
+        if latest["expira_en"] > time.time():
+            await release_cargo_claim(cargo["id"])
+            cache.upsert_cargo_cache(
+                user_id,
+                guild_id,
+                role_id,
+                latest["expira_en"],
+            )
+            return "extendido"
+
+        guild = bot.get_guild(guild_id)
+        if guild is None:
+            try:
+                guild = await bot.fetch_guild(guild_id)
+            except discord.NotFound:
+                await delete_cargo_temporal_by_id(cargo["id"])
+                return "servidor_inexistente"
+
+        role = guild.get_role(role_id)
+        if role is None:
+            roles = await guild.fetch_roles()
+            role = discord.utils.get(roles, id=role_id)
+        if role is None:
+            await delete_cargo_temporal_by_id(cargo["id"])
+            return "rol_inexistente"
+
+        try:
+            member = await guild.fetch_member(user_id)
+        except discord.NotFound:
+            await delete_cargo_temporal_by_id(cargo["id"])
+            return "miembro_fuera"
+
+        if role_id in {member_role.id for member_role in member.roles}:
+            await member.remove_roles(
+                role,
+                reason=(
+                    "Finalización de restricción temporal de comandos"
+                    if role_id == PUNISHMENT_ROLE_ID
+                    else "Expiración de rol temporal otorgado por un item"
+                ),
+            )
+
+        for intento in range(3):
+            try:
+                member_check = await guild.fetch_member(user_id)
+            except discord.NotFound:
+                member_check = None
+                break
+            if role_id not in {member_role.id for member_role in member_check.roles}:
+                break
+            if intento < 2:
+                await asyncio.sleep(0.75)
+        else:
+            raise RuntimeError("Discord todavía reporta el rol después de retirarlo")
+
+        await delete_cargo_temporal_by_id(cargo["id"])
+        return "retirado"
+
+
+async def check_cargos_loop():
+    """Procesa expiraciones desde Aiven y recupera pendientes tras reinicios."""
+    await bot.wait_until_ready()
+    while not bot.is_closed():
+        try:
+            cargos = await claim_expired_cargos(limit=50)
+            if not cargos:
+                await asyncio.sleep(30)
+                continue
+
+            retirados = 0
+            limpiados = 0
+            for cargo in cargos:
+                try:
+                    resultado = await _retirar_cargo_vencido(cargo)
+                    if resultado == "retirado":
+                        retirados += 1
+                    elif resultado in {
+                        "servidor_inexistente",
+                        "rol_inexistente",
+                        "miembro_fuera",
+                    }:
+                        limpiados += 1
+                except asyncio.CancelledError:
+                    raise
+                except Exception as error:
+                    intento = cargo.get("attempts", 0) + 1
+                    retry_after = min(3600, 30 * (2 ** min(cargo.get("attempts", 0), 7)))
+                    try:
+                        await mark_cargo_removal_failed(
+                            cargo["id"],
+                            f"{type(error).__name__}: {error}",
+                            retry_after,
+                        )
+                    except Exception:
+                        logger.exception(
+                            "No se pudo persistir el reintento del cargo temporal %s",
+                            cargo["id"],
+                        )
+                    logger.warning(
+                        "Cargo temporal %s no retirado (usuario=%s, rol=%s, "
+                        "intento=%s); reintento en %ss: %s",
+                        cargo["id"],
+                        cargo["user_id"],
+                        cargo["rol_id"],
+                        intento,
+                        retry_after,
+                        error,
+                    )
+                    if intento in {3, 10} or (
+                        isinstance(error, discord.Forbidden) and intento == 1
+                    ):
+                        await _alertar_fallo_retiro_cargo(cargo, error, intento)
+
+            if retirados or limpiados:
+                logger.info(
+                    "Cargos vencidos procesados: %s retirado(s), %s registro(s) obsoleto(s).",
+                    retirados,
+                    limpiados,
+                )
+            await asyncio.sleep(1 if len(cargos) >= 50 else 5)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("Error general procesando cargos temporales vencidos")
+            await asyncio.sleep(30)
+
+
+async def recover_expired_wagers_loop():
+    """Reembolsa apuestas vencidas sin interferir con despliegues activos."""
+    while not bot.is_closed():
+        try:
+            await asyncio.sleep(30)
+            recovered = await recover_pending_wagers()
+            if recovered:
+                logger.warning(
+                    "Se reembolsaron %s apuestas vencidas.",
+                    recovered,
+                )
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("Error recuperando apuestas vencidas")
+            await asyncio.sleep(30)
+
+
+async def _remove_temporary_roles_before_purge(user_id: int) -> bool:
+    for cargo in await get_user_temporary_roles(user_id):
+        guild = bot.get_guild(cargo["guild_id"])
+        if guild is None:
+            continue
+        role = guild.get_role(cargo["rol_id"])
+        if role is None:
+            continue
+        try:
+            member = guild.get_member(user_id) or await guild.fetch_member(user_id)
+        except discord.NotFound:
+            continue
+        try:
+            if role in member.roles:
+                await member.remove_roles(
+                    role,
+                    reason="Purga de datos por inactividad o solicitud del usuario",
+                )
+        except (discord.Forbidden, discord.HTTPException):
+            logger.exception(
+                "No se pudo retirar el rol %s antes de purgar al usuario %s",
+                cargo["rol_id"],
+                user_id,
+            )
+            return False
+    return True
+
+
+async def purge_inactive_users_loop():
+    await bot.wait_until_ready()
+    while not bot.is_closed():
+        try:
+            cutoff = time.time() - USER_INACTIVITY_RETENTION
+            user_ids = await get_inactive_user_ids(cutoff, limit=100)
+            purged = 0
+            for user_id in user_ids:
+                if await get_user_deletion_blocker(user_id):
+                    continue
+                if not await _remove_temporary_roles_before_purge(user_id):
+                    continue
+                if await purge_user_data(user_id, inactive_before=cutoff):
+                    _activity_writes.pop(user_id, None)
+                    purged += 1
+            if purged:
+                logger.info(
+                    "Purga automática: %s usuario(s) eliminado(s) tras 30 días de inactividad.",
+                    purged,
+                )
+            await asyncio.sleep(60 if len(user_ids) >= 100 else INACTIVE_PURGE_INTERVAL)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("Error en la purga automática de usuarios inactivos")
+            await asyncio.sleep(300)
+
+
+async def _delete_expired_bot_logs(
+    channel_id: int,
+    cutoff: datetime,
+    max_deletions: int,
+) -> tuple[int, bool]:
+    """Elimina mensajes antiguos solo cuando pertenecen a esta cuenta del bot."""
+    if max_deletions <= 0:
+        return 0, True
+
+    try:
+        channel = bot.get_channel(channel_id)
+        if channel is None:
+            channel = await bot.fetch_channel(channel_id)
+        if not hasattr(channel, "history"):
+            raise RuntimeError("el destino no permite consultar historial")
+    except (discord.Forbidden, discord.NotFound, discord.HTTPException, RuntimeError) as error:
+        logger.error(
+            "[LOG_CLEANUP:E_CHANNEL] No se pudo consultar el canal %s: %s",
+            channel_id,
+            error,
+        )
+        return 0, False
+
+    bot_user_id = bot.user.id if bot.user else None
+    if bot_user_id is None:
+        return 0, False
+
+    deleted = 0
+    batch_limit_reached = False
+    try:
+        async for message in channel.history(
+            limit=None,
+            before=cutoff,
+            oldest_first=True,
+        ):
+            if message.author.id != bot_user_id:
+                continue
+            try:
+                await message.delete()
+                deleted += 1
+                if deleted >= max_deletions:
+                    batch_limit_reached = True
+                    break
+                await asyncio.sleep(LOG_DELETE_DELAY_SECONDS)
+            except discord.NotFound:
+                continue
+            except discord.Forbidden as error:
+                logger.error(
+                    "[LOG_CLEANUP:E_FORBIDDEN] Sin permiso para eliminar en %s: %s",
+                    channel_id,
+                    error,
+                )
+                break
+            except discord.HTTPException as error:
+                logger.warning(
+                    "[LOG_CLEANUP:E_DELETE] No se eliminó el mensaje %s en %s: %s",
+                    message.id,
+                    channel_id,
+                    error,
+                )
+    except (discord.Forbidden, discord.HTTPException) as error:
+        logger.error(
+            "[LOG_CLEANUP:E_HISTORY] Falló la lectura del canal %s: %s",
+            channel_id,
+            error,
+        )
+    return deleted, batch_limit_reached
+
+
+async def log_retention_worker():
+    """Ejecuta la retención horaria con agenda persistente y reclamo atómico."""
+    await bot.wait_until_ready()
+    while not bot.is_closed():
+        try:
+            now = time.time()
+            schedule = await claim_maintenance_job(
+                LOG_CLEANUP_JOB_NAME,
+                LOG_CLEANUP_INTERVAL_SECONDS,
+                now=now,
+            )
+            if not schedule["claimed"]:
+                wait_for = max(1, schedule["next_run_at"] - now)
+                await asyncio.sleep(min(wait_for, LOG_CLEANUP_INTERVAL_SECONDS))
+                continue
+
+            cutoff = datetime.now(timezone.utc) - timedelta(
+                seconds=LOG_MESSAGE_RETENTION_SECONDS
+            )
+            deleted_messages = 0
+            backlog_pending = False
+            for channel_id in LOG_RETENTION_CHANNEL_IDS:
+                remaining = LOG_DELETE_BATCH_SIZE - deleted_messages
+                if remaining <= 0:
+                    backlog_pending = True
+                    break
+                channel_deleted, reached_limit = await _delete_expired_bot_logs(
+                    channel_id,
+                    cutoff,
+                    remaining,
+                )
+                deleted_messages += channel_deleted
+                if reached_limit:
+                    backlog_pending = True
+                    break
+
+            deleted_outbox = await delete_expired_failed_item_use_logs()
+            completed_at = time.time()
+            await complete_maintenance_job(
+                LOG_CLEANUP_JOB_NAME,
+                completed_at=completed_at,
+                next_run_at=(
+                    completed_at + LOG_CLEANUP_BACKLOG_DELAY_SECONDS
+                    if backlog_pending
+                    else None
+                ),
+            )
+            logger.info(
+                "[LOG_CLEANUP:OK] Eliminados %s mensaje(s) del bot y %s "
+                "registro(s) fallido(s) del outbox.%s",
+                deleted_messages,
+                deleted_outbox,
+                " Próximo lote en 5 minutos." if backlog_pending else "",
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("[LOG_CLEANUP:E_WORKER] Falló el worker de retención")
+            await asyncio.sleep(60)
+
+
+@bot.event
+async def on_command_error(ctx, error):
+    if isinstance(error, CommandAccessRestricted):
+        return
+    if isinstance(error, commands.CommandNotFound):
+        await ctx.reply(
+            "❌ Este comando no es válido, Consulta la Guia de la Nave en <#1505296434076057752>",
+            delete_after=10
+        )
+    elif isinstance(error, commands.CommandOnCooldown):
+        return  # deja que el handler del módulo lo maneje
+    else:
+        raise error
+
+async def shutdown():
+    logger.warning("Apagando bot — flusheando caché a DB...")
+    await flush_evento_puntos()
+    await cache.flush_to_db()
+    # ── Persistir cooldowns de collect pendientes en cache ──
+    all_cooldowns = cache.get_all_collect_cooldowns()
+    for user_id, cobros in all_cooldowns.items():
+        if cobros:
+            try:
+                await save_collect_cooldowns(user_id, cobros)
+            except Exception as e:
+                logger.warning(f"shutdown: error persistiendo collect cooldowns [{user_id}]: {e}")
+    logger.info("Caché flusheada correctamente.")
+    await bot.close()
+
+@bot.event
+async def on_ready():
+    global evento_flush_task, cargos_task, wager_recovery_task
+    global inactive_purge_task, log_cleanup_task, game_reminder_task
+    logger.info(f"Bot conectado como {bot.user}")
+    logger.info(
+        "Caché iniciada | Flush cada %s segundos",
+        cache.FLUSH_INTERVAL,
+    )
+    logger.info(f"Servidores activos: {len(bot.guilds)}")
+
+    try:
+        if GUILD_ID:
+            guild = discord.Object(id=int(GUILD_ID))
+            bot.tree.copy_global_to(guild=guild)
+            synced = await bot.tree.sync(guild=guild)
+            logger.info(f"Comandos Slash/Staff sincronizados en el servidor {GUILD_ID}: {len(synced)} comandos.")
+        else:
+            synced = await bot.tree.sync()
+            logger.info(f"Comandos Slash/Staff sincronizados globalmente: {len(synced)} comandos.")
+    except Exception as e:
+        logger.warning(f"Error sincronizando comandos slash: {e}")
+
+    asyncio.create_task(cache.flush_loop())
+    if not TEST_MODE and (cargos_task is None or cargos_task.done()):
+        cargos_task = asyncio.create_task(
+            check_cargos_loop(),
+            name="cargos-temporales-worker",
+        )
+        logger.info("Task de cargos temporales iniciada | Revisión persistente cada 30 segundos")
+    if not TEST_MODE and (evento_flush_task is None or evento_flush_task.done()):
+        evento_flush_task = asyncio.create_task(cache.evento_flush_loop())
+        logger.info("Task de evento iniciada | Flush de ranking cada 10 minutos")
+    if wager_recovery_task is None or wager_recovery_task.done():
+        wager_recovery_task = asyncio.create_task(
+            recover_expired_wagers_loop(),
+            name="apuestas-vencidas-worker",
+        )
+        logger.info("Task de apuestas vencidas iniciada | Revisión cada 30 segundos")
+    if not TEST_MODE and (inactive_purge_task is None or inactive_purge_task.done()):
+        inactive_purge_task = asyncio.create_task(
+            purge_inactive_users_loop(),
+            name="purga-usuarios-inactivos-worker",
+        )
+        logger.info("Task de privacidad iniciada | Purga tras 30 días de inactividad")
+    if not TEST_MODE and (log_cleanup_task is None or log_cleanup_task.done()):
+        log_cleanup_task = asyncio.create_task(
+            log_retention_worker(),
+            name="retencion-logs-worker",
+        )
+        logger.info(
+            "Task de retención de logs iniciada | Revisión persistente cada hora"
+        )
+    if game_reminder_task is None or game_reminder_task.done():
+        game_reminder_task = asyncio.create_task(
+            game_reminder_worker(bot), name="recordatorios-juegos-worker",
+        )
+    logger.info("\n⫷ 𝙋𝙐𝙍𝙋𝙇𝙀𝙅𝘼𝘾𝙆 𝙀𝙉 𝙇𝙄𝙉𝙀𝘼 ⫸\n")
+
+def run_bot():
+    async def main():
+        # ── Handler de señal SIGTERM (ej: SquareCloud apagando el proceso) ──
+        loop = asyncio.get_running_loop()
+        loop.add_signal_handler(signal.SIGTERM, lambda: asyncio.create_task(shutdown()))
+
+        await init_db()
+        await init_halloween_tables()
+        await init_game_reminders()
+        reembolsadas = await recover_pending_wagers()
+        if reembolsadas:
+            logger.warning(
+                "Se reembolsaron %s apuestas vencidas al iniciar.",
+                reembolsadas,
+            )
+        indexed_balances = await load_balance_index()
+        logger.info(
+            "Índice económico en RAM iniciado con %s usuario(s).",
+            indexed_balances,
+        )
+        indexed_names = await load_member_names()
+        logger.info("Caché ligera de nombres iniciada con %s usuario(s).", indexed_names)
+        await ensure_wager_constraints()
+        await create_game_config_table()
+        await load_game_config()
+        await load_dados_config()
+        await load_memo_config()
+        await load_items_to_cache()
+        await load_cargos_to_cache()
+        await load_item_role_restrictions_to_cache()
+        await load_collect_config_to_cache()
+        await load_veterano_config_to_cache()
+        await load_saboteador_config_to_cache()
+        await load_evento_to_cache()
+        await load_modules()
+        try:
+            await bot.start(TOKEN)
+        finally:
+            await flush_evento_puntos()
+            await cache.flush_to_db()
+            logger.info("Flush final completado al cerrar.")
+
+    asyncio.run(main())

@@ -1,0 +1,597 @@
+# Deployment refresh: 2026-08-17
+import asyncio
+import logging
+import time
+
+logger = logging.getLogger("purplejack.cache")
+
+# ── USUARIOS ───────────────────────────────────────────
+_cache = {}
+_dirty = set()
+_last_activity = {}
+_balance_index = {}
+_balance_index_version = 0
+_member_names = {}
+
+FLUSH_INTERVAL = 120   # 2 minutos — reduce pérdida potencial ante reinicios
+CACHE_EXPIRE   = 7200  # 2 horas de inactividad
+MAX_BANK       = 150_000  # Límite máximo de almacenamiento en banco
+
+
+# ── EVENTO PURPLE COINS ───────────────────────────────
+# El ranking se consulta desde RAM. Sus cambios se persisten de forma separada
+# para no mezclar su frecuencia de guardado con la caché principal de usuarios.
+EVENT_FLUSH_INTERVAL = 600
+_evento_activo = False
+_evento_iniciado_en = 0.0
+_evento_puntos = {}
+_evento_dirty = set()
+
+
+def is_evento_activo() -> bool:
+    return _evento_activo
+
+
+def start_evento(iniciado_en: float) -> None:
+    global _evento_activo, _evento_iniciado_en, _evento_puntos, _evento_dirty
+    _evento_activo = True
+    _evento_iniciado_en = iniciado_en
+    _evento_puntos = {}
+    _evento_dirty = set()
+
+
+def stop_evento() -> None:
+    global _evento_activo
+    _evento_activo = False
+
+
+def resume_evento() -> None:
+    global _evento_activo
+    _evento_activo = True
+
+
+def restore_evento(activo: bool, iniciado_en: float, puntos: dict) -> None:
+    global _evento_activo, _evento_iniciado_en, _evento_puntos, _evento_dirty
+    _evento_activo = activo
+    _evento_iniciado_en = iniciado_en
+    _evento_puntos = {int(user_id): int(monto) for user_id, monto in puntos.items() if monto > 0}
+    _evento_dirty = set()
+
+
+def record_evento_balance_delta(user_id: int, amount: int) -> None:
+    """Registra el cambio efectivo de balance mientras el evento está activo."""
+    if not _evento_activo or amount == 0:
+        return
+
+    actual = _evento_puntos.get(user_id, 0)
+    nuevo = max(0, actual + amount)
+    if nuevo == actual:
+        return
+
+    if nuevo > 0:
+        _evento_puntos[user_id] = nuevo
+    else:
+        _evento_puntos.pop(user_id, None)
+    _evento_dirty.add(user_id)
+
+
+def get_evento_top(limit: int = 10) -> list[tuple[int, int]]:
+    return sorted(_evento_puntos.items(), key=lambda entry: (-entry[1], entry[0]))[:limit]
+
+
+def get_evento_dirty_snapshot() -> dict[int, int]:
+    return {user_id: _evento_puntos.get(user_id, 0) for user_id in _evento_dirty}
+
+
+def clear_evento_dirty_if_unchanged(snapshot: dict[int, int]) -> None:
+    for user_id, puntos in snapshot.items():
+        if _evento_puntos.get(user_id, 0) == puntos:
+            _evento_dirty.discard(user_id)
+
+
+def clear_evento_puntos() -> None:
+    """Marca los puntajes actuales para que el próximo flush los elimine de DB."""
+    _evento_dirty.update(_evento_puntos)
+    _evento_puntos.clear()
+
+
+def touch_user(user_id):
+    _last_activity[user_id] = time.time()
+
+def get_cached(user_id):
+    touch_user(user_id)
+    return _cache.get(user_id)
+
+
+def _set_balance_index_value(user_id: int, balance: int) -> None:
+    global _balance_index_version
+    user_id = int(user_id)
+    balance = int(balance)
+    if _balance_index.get(user_id) == balance:
+        return
+    _balance_index[user_id] = balance
+    _balance_index_version += 1
+
+
+def restore_balance_index(rows) -> None:
+    """Restaura el índice económico completo desde la fuente persistente."""
+    global _balance_index, _balance_index_version
+    restored = {
+        int(row["id"]): int(row["balance"] or 0)
+        for row in rows
+    }
+    if restored != _balance_index:
+        _balance_index = restored
+        _balance_index_version += 1
+
+
+def get_balance_index_snapshot(limit: int | None = None):
+    """Devuelve versión y ranking inmutable con los balances vivos de RAM."""
+    ranking = sorted(
+        _balance_index.items(),
+        key=lambda entry: (-entry[1], entry[0]),
+    )
+    if limit is not None:
+        ranking = ranking[:max(0, int(limit))]
+    return _balance_index_version, tuple(ranking)
+
+
+def get_balance_index_version() -> int:
+    return _balance_index_version
+
+
+def get_indexed_balance(user_id: int, default: int = 0) -> int:
+    return int(_balance_index.get(int(user_id), default))
+
+
+def restore_member_names(rows) -> None:
+    """Restaura solo los nombres ya vistos; no consulta miembros de Discord."""
+    _member_names.clear()
+    _member_names.update({
+        int(row["user_id"]): row["display_name"]
+        for row in rows if row["display_name"]
+    })
+
+
+def get_member_name(user_id: int) -> str | None:
+    return _member_names.get(int(user_id))
+
+
+def set_member_name(user_id: int, name: str) -> None:
+    _member_names[int(user_id)] = name
+
+
+def reset_balance_index(balance: int = 0) -> None:
+    """Conserva los usuarios conocidos y reinicia todos sus balances."""
+    global _balance_index_version
+    balance = int(balance)
+    if any(current != balance for current in _balance_index.values()):
+        for user_id in tuple(_balance_index):
+            _balance_index[user_id] = balance
+        _balance_index_version += 1
+
+
+def set_cache(user_id, data):
+    _cache[user_id] = {
+        "balance":        data.get("balance", 0),
+        "bank":           data.get("bank", 0),
+        "cooldown_work":  data.get("cooldown_work", 0),
+        "cooldown_crime": data.get("cooldown_crime", 0),
+    }
+    _set_balance_index_value(user_id, _cache[user_id]["balance"])
+    touch_user(user_id)
+
+def mark_dirty(user_id):
+    _dirty.add(user_id)
+    touch_user(user_id)
+
+def update_cached_balance(user_id, amount, track_event=True):
+    if user_id in _cache:
+        _cache[user_id]["balance"] += amount
+        _set_balance_index_value(user_id, _cache[user_id]["balance"])
+        if track_event:
+            record_evento_balance_delta(user_id, amount)
+        mark_dirty(user_id)
+
+def update_cached_bank(user_id, amount, track_event=True):
+    """
+    Actualiza banco en caché respetando MAX_BANK.
+    Si amount es positivo y supera el límite, el excedente se aplica
+    automáticamente al balance del mismo usuario.
+    Retorna la cantidad efectivamente aplicada al banco.
+    """
+    if user_id not in _cache:
+        return amount  # sin caché no hay nada que hacer, DB lo manejará
+
+    if amount <= 0:
+        # Retiros o penalizaciones: siempre se aplican sin límite
+        _cache[user_id]["bank"] += amount
+        _set_balance_index_value(user_id, _cache[user_id]["balance"])
+        mark_dirty(user_id)
+        return amount
+
+    banco_actual = _cache[user_id]["bank"]
+    espacio_disponible = max(0, MAX_BANK - banco_actual)
+
+    aplicado_banco    = min(amount, espacio_disponible)
+    excedente_balance = amount - aplicado_banco
+
+    _cache[user_id]["bank"] += aplicado_banco
+
+    if excedente_balance > 0:
+        _cache[user_id]["balance"] += excedente_balance
+        if track_event:
+            record_evento_balance_delta(user_id, excedente_balance)
+
+    _set_balance_index_value(user_id, _cache[user_id]["balance"])
+
+    mark_dirty(user_id)
+    return aplicado_banco
+
+def update_cached_cooldown(user_id, command, timestamp):
+    if user_id in _cache:
+        _cache[user_id][f"cooldown_{command}"] = timestamp
+        mark_dirty(user_id)
+
+def get_dirty_users():
+    return list(_dirty)
+
+def clear_dirty(user_id):
+    _dirty.discard(user_id)
+
+def get_all_cache():
+    return _cache
+
+
+def purge_user_cache(user_id: int) -> None:
+    """Retira toda referencia personal del usuario conservada en RAM."""
+    global _balance_index_version
+    _cache.pop(user_id, None)
+    _member_names.pop(user_id, None)
+    if _balance_index.pop(user_id, None) is not None:
+        _balance_index_version += 1
+    _dirty.discard(user_id)
+    _last_activity.pop(user_id, None)
+    _rob_cooldowns.pop(user_id, None)
+    _cd_boosts.pop(user_id, None)
+    _inventory_cache.pop(user_id, None)
+    _cargos_cache.pop(user_id, None)
+    _collect_cooldowns.pop(user_id, None)
+    _top_cooldowns.pop(user_id, None)
+    _evento_puntos.pop(user_id, None)
+    _evento_dirty.discard(user_id)
+    for key in [key for key in _game_cooldowns if key[0] == user_id]:
+        _game_cooldowns.pop(key, None)
+    for key in [key for key in _role_assignment_locks if key[0] == user_id]:
+        _role_assignment_locks.pop(key, None)
+
+# ── ROB ────────────────────────────────────────────────
+_rob_cooldowns = {}      # {user_id: timestamp}
+
+def get_rob_cooldown(user_id):
+    return _rob_cooldowns.get(user_id, 0)
+
+def set_rob_cooldown(user_id, expira_en=None):
+    if expira_en is None:
+        from core.config import rob_config
+        expira_en = time.time() + rob_config["cooldown"]
+    _rob_cooldowns[user_id] = expira_en
+
+def clear_rob_cooldowns_cache():
+    _rob_cooldowns.clear()
+
+# ── GAME COOLDOWNS (ruleta / dados / otros) ────────────
+_game_cooldowns = {}  # {(user_id, game): expira_en}
+
+def get_game_cooldown_cache(user_id, game):
+    return _game_cooldowns.get((user_id, game), 0)
+
+def set_game_cooldown_cache(user_id, game, expira_en):
+    _game_cooldowns[(user_id, game)] = expira_en
+
+def clear_game_cooldowns_cache(game):
+    keys = [k for k in _game_cooldowns if k[1] == game]
+    for k in keys:
+        del _game_cooldowns[k]
+
+
+# ── REDUCCIÓN TEMPORAL DE COOLDOWNS ────────────────────
+_cd_boosts = {}  # {user_id: {expires_at, source_item_id, source_item_name}}
+
+
+def get_cd_boost_cache(user_id):
+    return _cd_boosts.get(user_id)
+
+
+def set_cd_boost_cache(user_id, boost):
+    _cd_boosts[user_id] = dict(boost)
+
+
+def clear_cd_boost_cache(user_id):
+    _cd_boosts.pop(user_id, None)
+
+# ── ITEMS ──────────────────────────────────────────────
+_items_cache = []
+
+def set_items_cache(items):
+    global _items_cache
+    _items_cache = items
+
+def get_items_cache():
+    return _items_cache
+
+# ── INVENTARIO POR USUARIO ─────────────────────────────
+_inventory_cache = {}
+
+def get_inventory_cache(user_id):
+    touch_user(user_id)
+    return _inventory_cache.get(user_id)
+
+def set_inventory_cache(user_id, items):
+    _inventory_cache[user_id] = items
+    touch_user(user_id)
+
+def add_to_inventory_cache(user_id, item):
+    if user_id not in _inventory_cache:
+        _inventory_cache[user_id] = []
+    inv = _inventory_cache[user_id]
+    existing = next((i for i in inv if i["nombre"].lower() == item["nombre"].lower()), None)
+    if existing:
+        existing["cantidad"] += item.get("cantidad", 1)
+    else:
+        entry = dict(item)
+        entry.setdefault("limite_uso", 0)
+        _inventory_cache[user_id].append(entry)
+    touch_user(user_id)
+
+def remove_from_inventory_cache(user_id, nombre):
+    if user_id not in _inventory_cache:
+        return
+    inv = _inventory_cache[user_id]
+    existing = next((i for i in inv if i["nombre"].lower() == nombre.lower()), None)
+    if existing:
+        existing["cantidad"] -= 1
+        if existing["cantidad"] <= 0:
+            _inventory_cache[user_id] = [i for i in inv if i["nombre"].lower() != nombre.lower()]
+
+def invalidate_inventory_cache(user_id):
+    _inventory_cache.pop(user_id, None)
+
+# ── CARGOS TEMPORALES ──────────────────────────────────
+_cargos_cache = {}
+_role_assignment_locks = {}
+
+
+def get_role_assignment_lock(user_id, guild_id, rol_id):
+    key = (user_id, guild_id, rol_id)
+    lock = _role_assignment_locks.get(key)
+    if lock is None:
+        lock = asyncio.Lock()
+        _role_assignment_locks[key] = lock
+    return lock
+
+def get_cargos_cache():
+    return _cargos_cache
+
+
+def get_active_cargo_expiry(user_id, guild_id, rol_id, now=None):
+    """Retorna la expiración vigente de un rol temporal o 0 si no existe."""
+    now = time.time() if now is None else now
+    return max(
+        (
+            cargo.get("expira_en", 0)
+            for cargo in _cargos_cache.get(user_id, [])
+            if cargo.get("guild_id") == guild_id
+            and cargo.get("rol_id") == rol_id
+            and cargo.get("expira_en", 0) > now
+        ),
+        default=0,
+    )
+
+def set_cargos_cache(data: dict):
+    global _cargos_cache
+    _cargos_cache = data
+
+def add_cargo_cache(user_id, guild_id, rol_id, expira_en):
+    if user_id not in _cargos_cache:
+        _cargos_cache[user_id] = []
+    _cargos_cache[user_id].append({
+        "rol_id":    rol_id,
+        "guild_id":  guild_id,
+        "expira_en": expira_en,
+    })
+
+
+def upsert_cargo_cache(user_id, guild_id, rol_id, expira_en):
+    """Mantiene una sola expiración vigente por usuario, servidor y rol."""
+    if user_id not in _cargos_cache:
+        _cargos_cache[user_id] = []
+    _cargos_cache[user_id] = [
+        cargo
+        for cargo in _cargos_cache[user_id]
+        if not (
+            cargo["guild_id"] == guild_id
+            and cargo["rol_id"] == rol_id
+        )
+    ]
+    _cargos_cache[user_id].append({
+        "rol_id": rol_id,
+        "guild_id": guild_id,
+        "expira_en": expira_en,
+    })
+
+
+def remove_cargo_cache(user_id, rol_id, guild_id=None):
+    if user_id in _cargos_cache:
+        _cargos_cache[user_id] = [
+            c for c in _cargos_cache[user_id]
+            if not (
+                c["rol_id"] == rol_id
+                and (guild_id is None or c["guild_id"] == guild_id)
+            )
+        ]
+        if not _cargos_cache[user_id]:
+            del _cargos_cache[user_id]
+
+# ── COLLECT CONFIG ─────────────────────────────────────
+_collect_config = {}
+
+def get_collect_config():
+    return _collect_config
+
+def set_collect_config(data: dict):
+    global _collect_config
+    _collect_config = data
+
+def upsert_collect_config(rol_id, cantidad, cooldown_horas):
+    _collect_config[rol_id] = {"cantidad": cantidad, "cooldown_horas": cooldown_horas}
+
+def delete_collect_config(rol_id):
+    _collect_config.pop(rol_id, None)
+
+_restricted_item_role_ids = set()
+
+def get_restricted_item_role_ids():
+    return _restricted_item_role_ids
+
+def set_restricted_item_role_ids(role_ids):
+    global _restricted_item_role_ids
+    _restricted_item_role_ids = set(role_ids)
+
+def remove_restricted_item_role_id(role_id):
+    _restricted_item_role_ids.discard(role_id)
+
+# ── COLLECT COOLDOWNS POR USUARIO ──────────────────────
+_collect_cooldowns = {}
+
+def get_collect_cooldowns(user_id):
+    return _collect_cooldowns.get(user_id)
+
+def get_all_collect_cooldowns() -> dict:
+    """Retorna copia de todos los cooldowns de collect en cache — usado en shutdown."""
+    return dict(_collect_cooldowns)
+
+def set_collect_cooldowns(user_id, data: dict):
+    _collect_cooldowns[user_id] = data
+    touch_user(user_id)
+
+def update_collect_cooldown(user_id, rol_id, timestamp):
+    if user_id not in _collect_cooldowns:
+        _collect_cooldowns[user_id] = {}
+    _collect_cooldowns[user_id][rol_id] = timestamp
+    touch_user(user_id)
+
+# ── TOP COOLDOWN ───────────────────────────────────────
+_top_cooldowns = {}
+
+def check_top_cooldown(user_id):
+    last = _top_cooldowns.get(user_id, 0)
+    return time.time() - last < 300
+
+def set_top_cooldown(user_id):
+    _top_cooldowns[user_id] = time.time()
+
+# ── LIMPIEZA DE CACHÉ INACTIVA ─────────────────────────
+def cleanup_cache():
+    now = time.time()
+    inactive = [
+        uid for uid, last in _last_activity.items()
+        if now - last > CACHE_EXPIRE
+    ]
+    for uid in inactive:
+        _inventory_cache.pop(uid, None)
+        _collect_cooldowns.pop(uid, None)
+        if uid not in _dirty:
+            _cache.pop(uid, None)
+            _last_activity.pop(uid, None)
+
+    for uid, expira_en in list(_rob_cooldowns.items()):
+        if expira_en <= now:
+            _rob_cooldowns.pop(uid, None)
+
+    for key, expira_en in list(_game_cooldowns.items()):
+        if expira_en <= now:
+            _game_cooldowns.pop(key, None)
+
+    for uid, boost in list(_cd_boosts.items()):
+        if boost.get("expires_at", 0) <= now:
+            _cd_boosts.pop(uid, None)
+
+    for uid, last in list(_top_cooldowns.items()):
+        if now - last >= 300:
+            _top_cooldowns.pop(uid, None)
+
+# ── VETERANO CONFIG ────────────────────────────────────
+_veterano_config = {}  # {rol_id: {"monto": int, "msj": str}}
+
+def get_veterano_config() -> dict:
+    return _veterano_config
+
+def set_veterano_config(data: dict):
+    global _veterano_config
+    _veterano_config = data
+
+def upsert_veterano_config(rol_id: int, monto: int, msj: str):
+    _veterano_config[rol_id] = {"monto": monto, "msj": msj}
+
+def delete_veterano_config(rol_id: int):
+    _veterano_config.pop(rol_id, None)
+
+
+# ── SABOTEADOR CONFIG ──────────────────────────────────
+_saboteador_role_ids = set()
+
+def get_saboteador_role_ids() -> set[int]:
+    return _saboteador_role_ids
+
+def set_saboteador_role_ids(role_ids) -> None:
+    global _saboteador_role_ids
+    _saboteador_role_ids = set(role_ids)
+
+def add_saboteador_role(role_id: int) -> None:
+    _saboteador_role_ids.add(role_id)
+
+def delete_saboteador_role(role_id: int) -> None:
+    _saboteador_role_ids.discard(role_id)
+
+
+# ── FLUSH USUARIOS A DB ────────────────────────────────
+async def flush_to_db():
+    """
+    Persiste todos los usuarios marcados como dirty a PostgreSQL.
+    El dirty-flag se limpia SOLO después de un write exitoso,
+    garantizando que los datos no se pierdan ante un fallo de conexión.
+    """
+    from core.database import flush_user_to_db
+    dirty = get_dirty_users()
+    if not dirty:
+        return
+
+    flushed = 0
+    for user_id in dirty:
+        data = _cache.get(user_id)
+        if not data:
+            clear_dirty(user_id)   # sin datos en caché → nada que persistir
+            continue
+        try:
+            if await flush_user_to_db(user_id):
+                flushed += 1
+        except Exception as e:
+            logger.warning(f"flush_to_db error para {user_id}: {e} — reintentará en próximo ciclo")
+
+    if flushed:
+        logger.debug(f"flush_to_db: {flushed} usuario(s) persistidos")
+
+
+async def flush_loop():
+    while True:
+        await asyncio.sleep(FLUSH_INTERVAL)
+        await flush_to_db()
+        cleanup_cache()
+
+
+async def evento_flush_loop():
+    while True:
+        await asyncio.sleep(EVENT_FLUSH_INTERVAL)
+        from core.database import flush_evento_puntos
+        await flush_evento_puntos()

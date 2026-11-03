@@ -1,0 +1,2465 @@
+import re
+import logging
+import discord
+import asyncio
+import time
+from io import BytesIO
+
+logger = logging.getLogger(__name__)
+from math import ceil
+from discord.ext import commands
+from discord import app_commands
+from openpyxl import Workbook
+from core.database import (
+    get_user, update_balance, update_bank, pool,
+    add_item, edit_item, delete_item,
+    get_item_by_name, add_to_inventory, get_all_users_net_worth,
+    get_all_inventarios, get_stock_inventory_summary, load_items_to_cache,
+    add_stock, remove_inventory_quantity,
+    set_item_log_uso_channel,
+    upsert_collect_config_db, delete_collect_config_db, delete_orphan_collect_configs_db,
+    set_item_role_restrictions_db, remove_item_role_restriction_db,
+    save_game_config, save_ruleta_config,
+    save_rob_config, save_dados_config, save_memo_config, save_blackjack_config,
+    clear_game_cooldowns,
+    activar_evento as activar_evento_db, cerrar_evento as cerrar_evento_db,
+    flush_evento_puntos, set_duel_cooldown_config, get_duel_active_config,
+    set_duel_active_config, clear_command_cooldowns, set_system_toggle,
+    add_cargo_temporal, delete_cargo_temporal, get_cargo_temporal,
+)
+from core import cache
+from core.halloween import (
+    CANDY,
+    add_candy_balance,
+    add_craft_item,
+    delete_craft_item,
+    get_candy_ranking_page,
+    get_craft_items,
+)
+from core.member_resolution import resolve_guild_member
+from core.config import (
+    ruleta_config, game_config, dados_config, memo_config,
+    blackjack_config, COIN,
+    STAFF_ROLE_ID, COORDINADOR_ROLE_ID, PUNISHMENT_ROLE_ID
+)
+from modules.memo import _memo_cooldowns
+from modules.Empleos import (
+    _EMPLEOS_CACHE, get_empleo_user, save_empleo_user,
+    get_all_experiencia_laboral,
+)
+
+EVENTO_THUMBNAIL_URL = "https://pub-a09b3609b6b34dfab5c7aa7742cd1a8a.r2.dev/Purple%20jack%20Harcode/PurpleThumb.png"
+EVENTO_TOP_ICON = "<:ygoldstar:1004555717610590258>"
+
+
+def is_staff():
+    async def predicate(interaction: discord.Interaction):
+        user_role_ids = {r.id for r in interaction.user.roles}
+        if STAFF_ROLE_ID not in user_role_ids and COORDINADOR_ROLE_ID not in user_role_ids:
+            await interaction.response.send_message(
+                "❌ No tienes permisos para usar este comando.", ephemeral=True
+            )
+            return False
+        return True
+    return app_commands.check(predicate)
+
+
+def create_economia_menu_embed():
+    return discord.Embed(
+        title="📊 Economía",
+        description="Selecciona una opción para examinar la economía de PurpleJack.",
+        color=discord.Color.dark_purple()
+    )
+
+
+# ── MODAL RESET ────────────────────────────────────────
+
+class ResetAllModal(discord.ui.Modal, title="Confirmar Reset Global"):
+    confirmacion = discord.ui.TextInput(label='Escribe "Reset" para confirmar', placeholder="Reset", max_length=5)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        if self.confirmacion.value != "Reset":
+            return await interaction.response.send_message("❌ Confirmación incorrecta.", ephemeral=True)
+        async with pool.acquire() as conn:
+            async with conn.transaction():
+                await conn.execute("UPDATE users SET balance=0, bank=0")
+                await conn.execute(
+                    """
+                    UPDATE wagers SET status='lost', payout=0
+                    WHERE status='pending'
+                    """
+                )
+        cache._cache.clear()
+        cache._dirty.clear()
+        cache.reset_balance_index(0)
+        if cache.is_evento_activo():
+            cache.clear_evento_puntos()
+            await flush_evento_puntos()
+        await interaction.response.send_message("✅ Reset global completado.", ephemeral=False)
+
+# ── RESET DE EXPERIENCIA LABORAL ────────────────────────
+
+class ResetExpLaboralGlobalModal(discord.ui.Modal, title="Confirmar Reset de XP Laboral"):
+    confirmacion = discord.ui.TextInput(
+        label='Escribe "Reset" para confirmar',
+        placeholder="Reset",
+        max_length=5,
+    )
+
+    def __init__(self, owner_id: int):
+        super().__init__()
+        self.owner_id = owner_id
+
+    async def on_submit(self, interaction: discord.Interaction):
+        if interaction.user.id != self.owner_id:
+            return await interaction.response.send_message(
+                "❌ Esta confirmación no te pertenece.", ephemeral=True
+            )
+        if self.confirmacion.value != "Reset":
+            return await interaction.response.send_message(
+                "❌ Confirmación incorrecta.", ephemeral=True
+            )
+
+        async with pool.acquire() as conn:
+            rows = await conn.fetch(
+                "UPDATE empleos_users SET exp_laboral=0 "
+                "WHERE exp_laboral <> 0 RETURNING user_id"
+            )
+
+        _EMPLEOS_CACHE.clear()
+        await interaction.response.send_message(
+            f"✅ Se reinició la XP Laboral de **{len(rows)}** usuarios.",
+            ephemeral=True,
+        )
+
+
+class CleanOrphanCollectModal(discord.ui.Modal, title="Limpiar Collects Huérfanos"):
+    confirmacion = discord.ui.TextInput(
+        label='Escribe "Limpiar" para confirmar',
+        placeholder="Limpiar",
+        max_length=7,
+    )
+
+    def __init__(self, owner_id: int):
+        super().__init__()
+        self.owner_id = owner_id
+
+    async def on_submit(self, interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True)
+
+        if interaction.user.id != self.owner_id:
+            return await interaction.followup.send(
+                "❌ Esta confirmación no te pertenece.", ephemeral=True
+            )
+        if self.confirmacion.value != "Limpiar":
+            return await interaction.followup.send(
+                "❌ Confirmación incorrecta.", ephemeral=True
+            )
+        if interaction.guild is None:
+            return await interaction.followup.send(
+                "❌ Este comando solo puede usarse dentro del servidor.", ephemeral=True
+            )
+
+        existing_role_ids = {role.id for role in interaction.guild.roles}
+        orphan_role_ids = [
+            role_id
+            for role_id in cache.get_collect_config()
+            if role_id not in existing_role_ids
+        ]
+        try:
+            deleted_count = await delete_orphan_collect_configs_db(orphan_role_ids)
+        except Exception:
+            logger.exception("Error limpiando configuraciones collect huérfanas")
+            return await interaction.followup.send(
+                "❌ No se pudieron limpiar las configuraciones collect huérfanas.",
+                ephemeral=True,
+            )
+
+        await interaction.followup.send(
+            f"✅ Se eliminaron **{deleted_count}** configuraciones collect de roles inexistentes.",
+            ephemeral=True,
+        )
+
+
+class SaldosPaginationView(discord.ui.View):
+    def __init__(self, author_id, users):
+        super().__init__(timeout=120)
+        self.author_id = author_id
+        self.users = sorted(
+            users,
+            key=lambda u: u["balance"] + u["bank"],
+            reverse=True
+        )
+        self.page = 0
+
+    def get_embed(self):
+        total_items = len(self.users)
+        total_pages = max(1, ceil(total_items / 10))
+        start = self.page * 10
+        end = start + 10
+        page_users = self.users[start:end]
+
+        embed = discord.Embed(
+            title="📊 Saldos Netos",
+            color=discord.Color.gold()
+        )
+
+        if not page_users:
+            embed.description = "No hay usuarios con neto ≥ 100 Purple Coins."
+        else:
+            embed.description = "\n".join(
+                f"**{idx}.** <@{user['id']}> — **{user['balance'] + user['bank']}** {COIN}"
+                for idx, user in enumerate(page_users, start=start + 1)
+            )
+
+        embed.set_footer(text=f"Página {self.page + 1}/{total_pages}")
+        return embed
+
+    @discord.ui.button(label="Anterior", style=discord.ButtonStyle.secondary)
+    async def anterior(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if interaction.user.id != self.author_id:
+            return await interaction.response.send_message("❌ Solo el creador puede usar estos botones.", ephemeral=True)
+        if self.page > 0:
+            self.page -= 1
+            await interaction.response.edit_message(embed=self.get_embed(), view=self)
+        else:
+            await interaction.response.send_message("📌 Ya estás en la primera página.", ephemeral=True)
+
+    @discord.ui.button(label="Siguiente", style=discord.ButtonStyle.secondary)
+    async def siguiente(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if interaction.user.id != self.author_id:
+            return await interaction.response.send_message("❌ Solo el creador puede usar estos botones.", ephemeral=True)
+        total_pages = max(1, ceil(len(self.users) / 10))
+        if self.page < total_pages - 1:
+            self.page += 1
+            await interaction.response.edit_message(embed=self.get_embed(), view=self)
+        else:
+            await interaction.response.send_message("📌 Ya estás en la última página.", ephemeral=True)
+
+    @discord.ui.button(label="Atrás", style=discord.ButtonStyle.danger)
+    async def atras(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if interaction.user.id != self.author_id:
+            return await interaction.response.send_message("❌ Solo el creador puede usar estos botones.", ephemeral=True)
+        await interaction.response.edit_message(embed=create_economia_menu_embed(), view=EconomiaView(self.author_id))
+
+
+class CandyRankingView(discord.ui.View):
+    PAGE_SIZE = 10
+
+    def __init__(self, author_id: int):
+        super().__init__(timeout=300)
+        self.author_id = author_id
+        self.page = 0
+        self.message = None
+
+    def _display_name(self, user_id: int) -> str:
+        name = cache.get_member_name(user_id)
+        if name:
+            return discord.utils.escape_markdown(discord.utils.escape_mentions(name))[:80]
+        return f"<@{user_id}>"
+
+    async def get_embed(self) -> discord.Embed:
+        rows, total = await get_candy_ranking_page(self.page * self.PAGE_SIZE, self.PAGE_SIZE)
+        pages = max(1, ceil(total / self.PAGE_SIZE))
+        if self.page >= pages:
+            self.page = pages - 1
+            rows, total = await get_candy_ranking_page(self.page * self.PAGE_SIZE, self.PAGE_SIZE)
+        self.anterior.disabled = self.page == 0
+        self.siguiente.disabled = self.page >= pages - 1
+
+        embed = discord.Embed(title="🍬 Top 10 Dulces", color=discord.Color.orange())
+        if not rows:
+            embed.description = "Todavía no hay usuarios con dulces."
+        else:
+            lines = []
+            for position, row in enumerate(rows, start=self.page * self.PAGE_SIZE + 1):
+                name = self._display_name(row["user_id"])
+                rank = ("🥇", "🥈", "🥉")[position - 1] if position <= 3 else f"`{position}.`"
+                lines.append(
+                    f"{rank} **{name}** (<@{row['user_id']}>) — "
+                    f"**{row['balance']:,}** {CANDY}"
+                )
+            embed.description = "\n".join(lines)
+        embed.set_footer(text=f"Página {self.page + 1}/{pages} • {total} usuarios con dulces")
+        return embed
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id == self.author_id:
+            return True
+        await interaction.response.send_message(
+            "❌ Solo quien abrió este ranking puede usar los botones.", ephemeral=True,
+        )
+        return False
+
+    async def _change_page(self, interaction: discord.Interaction, direction: int) -> None:
+        previous_page = self.page
+        await interaction.response.defer()
+        self.page = max(0, self.page + direction)
+        try:
+            embed = await self.get_embed()
+            await interaction.edit_original_response(embed=embed, view=self)
+        except Exception:
+            self.page = previous_page
+            logger.exception("No se pudo cambiar la página del ranking de dulces")
+            await interaction.followup.send(
+                "❌ No pude actualizar el ranking. Inténtalo de nuevo.", ephemeral=True,
+            )
+
+    @discord.ui.button(label="Anterior", style=discord.ButtonStyle.secondary)
+    async def anterior(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self._change_page(interaction, -1)
+
+    @discord.ui.button(label="Siguiente", style=discord.ButtonStyle.secondary)
+    async def siguiente(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self._change_page(interaction, 1)
+
+    async def on_timeout(self):
+        for child in self.children:
+            child.disabled = True
+        if self.message is not None:
+            try:
+                await self.message.edit(view=self)
+            except (discord.HTTPException, discord.NotFound):
+                pass
+
+
+class ExperienciaLaboralPaginationView(discord.ui.View):
+    PAGE_SIZE = 10
+
+    def __init__(self, author_id: int, guild: discord.Guild, rows: list[dict]):
+        super().__init__(timeout=300)
+        self.author_id = author_id
+        self.guild = guild
+        self.rows = rows
+        self.page = 0
+        self.message = None
+        self._actualizar_botones()
+
+    def _actualizar_botones(self):
+        total_pages = max(1, ceil(len(self.rows) / self.PAGE_SIZE))
+        self.anterior.disabled = self.page == 0
+        self.siguiente.disabled = self.page >= total_pages - 1
+
+    async def get_embed(self):
+        self._actualizar_botones()
+        total_pages = max(1, ceil(len(self.rows) / self.PAGE_SIZE))
+        start = self.page * self.PAGE_SIZE
+        page_rows = self.rows[start:start + self.PAGE_SIZE]
+
+        embed = discord.Embed(title="⭐ EXP Laboral", color=discord.Color.blurple())
+        if not page_rows:
+            embed.description = "No hay registros de experiencia laboral actualmente."
+        else:
+            lines = ["Pos | Usuario               | Empleo       | EXP"]
+            lines.append("----+-----------------------+--------------+-----")
+            for position, row in enumerate(page_rows, start=start + 1):
+                member = await resolve_guild_member(self.guild, row["user_id"])
+                nick = member.nick or member.display_name if member else f"ID {row['user_id']}"
+                nick = nick.replace("`", "'")[:20]
+                empleo = (row.get("empleo_actual") or "Sin empleo").title().replace("`", "'")[:12]
+                lines.append(f"{position:>3} | {nick:<21} | {empleo:<12} | {row.get('exp_laboral', 0):>3}")
+            embed.description = f"```\n{'\n'.join(lines)}\n```"
+
+        embed.set_footer(text=f"Página {self.page + 1}/{total_pages} • {len(self.rows)} registros")
+        return embed
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id == self.author_id:
+            return True
+        await interaction.response.send_message("❌ Solo quien ejecutó el comando puede usar estos botones.", ephemeral=True)
+        return False
+
+    @discord.ui.button(label="Anterior", style=discord.ButtonStyle.secondary)
+    async def anterior(self, interaction: discord.Interaction, button: discord.ui.Button):
+        self.page -= 1
+        await interaction.response.edit_message(embed=await self.get_embed(), view=self)
+
+    @discord.ui.button(label="Siguiente", style=discord.ButtonStyle.secondary)
+    async def siguiente(self, interaction: discord.Interaction, button: discord.ui.Button):
+        self.page += 1
+        await interaction.response.edit_message(embed=await self.get_embed(), view=self)
+
+    async def on_timeout(self):
+        for child in self.children:
+            child.disabled = True
+        if self.message:
+            try:
+                await self.message.edit(view=self)
+            except (discord.HTTPException, discord.NotFound):
+                pass
+
+
+class StockListPaginationView(discord.ui.View):
+    PAGE_SIZE = 10
+
+    def __init__(self, author_id: int, rows: list[dict]):
+        super().__init__(timeout=300)
+        self.author_id = author_id
+        self.rows = rows
+        self.page = 0
+        self.message = None
+        self._actualizar_botones()
+
+    def _actualizar_botones(self):
+        total_pages = max(1, ceil(len(self.rows) / self.PAGE_SIZE))
+        self.anterior.disabled = self.page == 0
+        self.siguiente.disabled = self.page >= total_pages - 1
+
+    def get_embed(self):
+        self._actualizar_botones()
+        total_pages = max(1, ceil(len(self.rows) / self.PAGE_SIZE))
+        start = self.page * self.PAGE_SIZE
+        page_rows = self.rows[start:start + self.PAGE_SIZE]
+
+        embed = discord.Embed(
+            title="📦 Control de Stock",
+            description="Existencias actuales de la tienda y de todos los inventarios.",
+            color=discord.Color.dark_purple(),
+        )
+
+        nombres = []
+        stock_tienda = []
+        stock_inventario = []
+        for row in page_rows:
+            nombre = str(row["nombre"]).replace("`", "'")
+            nombres.append(nombre[:22])
+            stock = int(row["stock"])
+            stock_tienda.append("∞" if stock == -1 else str(stock))
+            stock_inventario.append(str(int(row["stock_inventario"])))
+
+        embed.add_field(
+            name="ITEM",
+            value=f"```\n{'\n'.join(nombres)}\n```",
+            inline=True,
+        )
+        embed.add_field(
+            name="Stock Tienda",
+            value=f"```\n{'\n'.join(stock_tienda)}\n```",
+            inline=True,
+        )
+        embed.add_field(
+            name="Stock Invent.",
+            value=f"```\n{'\n'.join(stock_inventario)}\n```",
+            inline=True,
+        )
+
+        total_inventarios = sum(int(row["stock_inventario"]) for row in self.rows)
+        embed.set_footer(
+            text=(
+                f"Página {self.page + 1}/{total_pages} • "
+                f"{len(self.rows)} artículos • {total_inventarios} unidades en inventarios"
+            )
+        )
+        return embed
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id == self.author_id:
+            return True
+        await interaction.response.send_message(
+            "❌ Solo quien ejecutó el comando puede usar estos botones.",
+            ephemeral=True,
+        )
+        return False
+
+    @discord.ui.button(label="Anterior", style=discord.ButtonStyle.secondary)
+    async def anterior(self, interaction: discord.Interaction, button: discord.ui.Button):
+        self.page -= 1
+        await interaction.response.edit_message(embed=self.get_embed(), view=self)
+
+    @discord.ui.button(label="Siguiente", style=discord.ButtonStyle.secondary)
+    async def siguiente(self, interaction: discord.Interaction, button: discord.ui.Button):
+        self.page += 1
+        await interaction.response.edit_message(embed=self.get_embed(), view=self)
+
+    async def on_timeout(self):
+        for child in self.children:
+            child.disabled = True
+        if self.message:
+            try:
+                await self.message.edit(view=self)
+            except (discord.HTTPException, discord.NotFound):
+                pass
+
+
+class EconomiaView(discord.ui.View):
+    def __init__(self, author_id):
+        super().__init__(timeout=180)
+        self.author_id = author_id
+
+    @discord.ui.button(label="Saldos Netos", style=discord.ButtonStyle.primary)
+    async def saldos_netos(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if interaction.user.id != self.author_id:
+            return await interaction.response.send_message("❌ Solo el creador puede usar estos botones.", ephemeral=True)
+
+        await interaction.response.defer()
+        users = await get_all_users_net_worth(100)
+        view = SaldosPaginationView(self.author_id, users)
+        await interaction.edit_original_response(content=None, embed=view.get_embed(), view=view)
+
+    @discord.ui.button(label="Inventarios", style=discord.ButtonStyle.success)
+    async def inventarios(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if interaction.user.id != self.author_id:
+            return await interaction.response.send_message("❌ Solo el creador puede usar estos botones.", ephemeral=True)
+
+        await interaction.response.defer()
+        await asyncio.sleep(10)
+
+        rows = await get_all_inventarios()
+        wb = Workbook()
+        ws = wb.active
+        ws.title = "Inventarios"
+
+        ws.append(["Usuario", "Item", "Cantidad"])
+        current_user = None
+        user_index = 1
+        user_names = {}
+
+        for row in rows:
+            user_id = row["user_id"]
+            if user_id not in user_names:
+                member = None
+                if interaction.guild:
+                    member = interaction.guild.get_member(user_id)
+                    if member is None:
+                        try:
+                            member = await interaction.guild.fetch_member(user_id)
+                        except Exception:
+                            member = None
+                if member:
+                    user_names[user_id] = member.nick or member.name
+                else:
+                    user_obj = interaction.client.get_user(user_id)
+                    if not user_obj:
+                        try:
+                            user_obj = await interaction.client.fetch_user(user_id)
+                        except Exception:
+                            user_obj = None
+                    user_names[user_id] = user_obj.name if user_obj else f"Usuario {user_id}"
+
+            if current_user != user_id:
+                current_user = user_id
+                ws.append([])
+                ws.append([f"{user_index}. {user_names[user_id]}", "", ""])
+                user_index += 1
+            ws.append(["", row["nombre"], row["cantidad"]])
+
+        buffer = BytesIO()
+        wb.save(buffer)
+        buffer.seek(0)
+
+        dispositivo = discord.File(buffer, filename="Inv_actual.xlsx")
+        await interaction.followup.send(
+            content="✅ Inventarios generados. Descarga el archivo a continuación.",
+            file=dispositivo,
+            ephemeral=True
+        )
+
+
+# ── STAFF COG ──────────────────────────────────────────
+
+class Staff(commands.Cog):
+    def __init__(self, bot):
+        self.bot = bot
+
+    def parse_cooldown(self, value: str):
+        value = value.lower().strip()
+        if value.endswith("h"):
+            return int(value[:-1]) * 3600
+        if value.endswith("m"):
+            return int(value[:-1]) * 60
+        if value.endswith("s"):
+            return int(value[:-1])
+        raise ValueError("Formato inválido")
+
+    def parse_cooldown_str(self, seconds: int) -> str:
+        if seconds >= 3600:
+            h = seconds // 3600
+            rest = seconds % 3600
+            if rest == 0:
+                return f"{h}h"
+            return f"{h}h{rest // 60}m" if rest % 60 == 0 else f"{h}h{rest // 60}m{rest % 60}s"
+        if seconds >= 60:
+            m = seconds // 60
+            rest = seconds % 60
+            return f"{m}m" if rest == 0 else f"{m}m{rest}s"
+        return f"{seconds}s"
+
+    @staticmethod
+    def parse_punishment_duration(value: str) -> int:
+        match = re.fullmatch(r"([1-9]\d*)\s*([mh])", value.strip().lower())
+        if not match:
+            raise ValueError("Formato inválido")
+        amount = int(match.group(1))
+        return amount * (3600 if match.group(2) == "h" else 60)
+
+    @app_commands.command(
+        name="punish",
+        description="Restringe temporalmente los comandos con prefijo de un usuario",
+    )
+    @app_commands.rename(usuario="user", tiempo="time")
+    @app_commands.describe(
+        usuario="Usuario a restringir",
+        tiempo="Duración: minutos (m) u horas (h). Ej.: 30m, 2h",
+    )
+    @is_staff()
+    async def punish(
+        self,
+        interaction: discord.Interaction,
+        usuario: discord.Member,
+        tiempo: str,
+    ):
+        try:
+            duration = self.parse_punishment_duration(tiempo)
+        except ValueError:
+            return await interaction.response.send_message(
+                "❌ Duración inválida. Usa únicamente minutos u horas, por ejemplo: `30m` o `2h`.",
+                ephemeral=True,
+            )
+
+        if usuario.bot:
+            return await interaction.response.send_message(
+                "❌ No se puede restringir a un bot.", ephemeral=True
+            )
+        if interaction.guild is None:
+            return await interaction.response.send_message(
+                "❌ Este comando solo puede utilizarse dentro de un servidor.",
+                ephemeral=True,
+            )
+
+        role = interaction.guild.get_role(PUNISHMENT_ROLE_ID)
+        if role is None:
+            return await interaction.response.send_message(
+                "❌ No encontré el rol configurado de Expulsado. Verifica su ID y que el bot esté en el servidor.",
+                ephemeral=True,
+            )
+
+        await interaction.response.defer(ephemeral=False)
+        now = time.time()
+        previous = await get_cargo_temporal(usuario.id, interaction.guild.id, role.id)
+        previous_active = bool(previous and previous["expira_en"] > now)
+        expires_at = await add_cargo_temporal(
+            usuario.id,
+            interaction.guild.id,
+            role.id,
+            now + duration,
+        )
+
+        role_was_present = role in usuario.roles
+        try:
+            if not role_was_present:
+                await usuario.add_roles(
+                    role,
+                    reason=(
+                        f"Restricción temporal de comandos aplicada por {interaction.user} "
+                        f"hasta {int(expires_at)}"
+                    ),
+                )
+            verified_member = await interaction.guild.fetch_member(usuario.id)
+            if role.id not in {member_role.id for member_role in verified_member.roles}:
+                raise RuntimeError("Discord no confirmó la asignación del rol")
+        except (discord.Forbidden, discord.HTTPException, RuntimeError) as error:
+            if not previous_active:
+                await delete_cargo_temporal(usuario.id, role.id, interaction.guild.id)
+            logger.warning(
+                "No se pudo aplicar la restricción a %s: %s",
+                usuario.id,
+                error,
+            )
+            return await interaction.followup.send(
+                "❌ No pude asignar o verificar el rol de Expulsado. La restricción no fue aplicada. "
+                "Revisa los permisos y la jerarquía del rol del bot.",
+                ephemeral=True,
+            )
+
+        await interaction.followup.send(
+            f"✅ {usuario.mention} fue restringido hasta <t:{int(expires_at)}:F> "
+            f"(<t:{int(expires_at)}:R>).",
+            ephemeral=False,
+        )
+
+    @app_commands.command(name="balance", description="Ver balance y banco de un miembro")
+    @app_commands.describe(usuario="Miembro a consultar")
+    @is_staff()
+    async def balance_staff(self, interaction, usuario: discord.Member):
+        await interaction.response.defer(ephemeral=True)
+        user = await get_user(usuario.id)
+        embed = discord.Embed(title=f"💰 Finanzas de {usuario.display_name}", color=discord.Color.gold())
+        embed.add_field(name=f"{COIN} Balance", value=f"{user['balance']} {COIN}", inline=True)
+        embed.add_field(name="🏦 Banco", value=f"{user['bank']} {COIN}", inline=True)
+        embed.set_thumbnail(url=usuario.display_avatar.url)
+        await interaction.followup.send(embed=embed, ephemeral=True)
+
+    @app_commands.command(name="dulces_balance", description="Consulta el ranking de saldos de dulces")
+    @is_staff()
+    async def dulces_balance(self, interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True)
+        view = CandyRankingView(interaction.user.id)
+        try:
+            embed = await view.get_embed()
+            view.message = await interaction.followup.send(
+                embed=embed,
+                view=view,
+                ephemeral=True,
+                wait=True,
+                allowed_mentions=discord.AllowedMentions.none(),
+            )
+        except Exception:
+            logger.exception("No se pudo abrir el ranking de dulces")
+            await interaction.followup.send(
+                "❌ No pude consultar los saldos de dulces. Inténtalo de nuevo.",
+                ephemeral=True,
+            )
+
+    @app_commands.command(name="add_candy", description="Añade dulces al saldo de un miembro")
+    @app_commands.describe(usuario="Miembro que recibirá los dulces", cantidad="Dulces a añadir")
+    @is_staff()
+    async def add_candy(self, interaction: discord.Interaction,
+                        usuario: discord.Member, cantidad: int):
+        if not 0 < cantidad <= 2_147_483_647:
+            return await interaction.response.send_message(
+                "❌ La cantidad debe estar entre 1 y 2.147.483.647.", ephemeral=True,
+            )
+        await interaction.response.defer(ephemeral=True)
+        try:
+            balance = await add_candy_balance(usuario.id, cantidad)
+        except Exception:
+            logger.exception("No se pudieron acreditar dulces a %s", usuario.id)
+            return await interaction.followup.send(
+                "❌ No pude acreditar los dulces. Comprueba el saldo e inténtalo de nuevo.",
+                ephemeral=True,
+            )
+        await interaction.followup.send(
+            f"✅ Se añadieron **{cantidad:,}** {CANDY} a **{usuario.display_name}**. "
+            f"Saldo actual: **{balance:,}** {CANDY}.",
+            ephemeral=True,
+            allowed_mentions=discord.AllowedMentions.none(),
+        )
+
+    @app_commands.command(name="addcoins", description="Añade PurpleCoins a un miembro")
+    @app_commands.describe(usuario="Miembro", cantidad="Cantidad a añadir", destino="Balance o Banco")
+    @app_commands.choices(destino=[
+        app_commands.Choice(name="Balance", value="balance"),
+        app_commands.Choice(name="Banco", value="banco"),
+    ])
+    @is_staff()
+    async def addcoins(self, interaction, usuario: discord.Member, cantidad: int, destino: app_commands.Choice[str]):
+        if cantidad <= 0:
+            return await interaction.response.send_message("❌ La cantidad debe ser mayor a 0.", ephemeral=False)
+        await interaction.response.defer(ephemeral=False)
+        if destino.value == "balance":
+            await update_balance(usuario.id, cantidad, track_event=False)
+        else:
+            await update_bank(usuario.id, cantidad, track_event=False)
+        await interaction.followup.send(
+            f"✅ Se añadieron **{cantidad}** {COIN} al **{destino.name}** de {usuario.mention}.", ephemeral=False
+        )
+
+    @app_commands.command(name="removecoins", description="Remueve PurpleCoins a un miembro")
+    @app_commands.describe(usuario="Miembro", cantidad="Cantidad a remover", destino="Balance o Banco")
+    @app_commands.choices(destino=[
+        app_commands.Choice(name="Balance", value="balance"),
+        app_commands.Choice(name="Banco", value="banco"),
+    ])
+    @is_staff()
+    async def removecoins(self, interaction, usuario: discord.Member, cantidad: int, destino: app_commands.Choice[str]):
+        if cantidad <= 0:
+            return await interaction.response.send_message("❌ La cantidad debe ser mayor a 0.", ephemeral=False)
+        await interaction.response.defer(ephemeral=False)
+        if destino.value == "balance":
+            await update_balance(usuario.id, -cantidad)
+        else:
+            await update_bank(usuario.id, -cantidad)
+        await interaction.followup.send(
+            f"✅ Se removieron **{cantidad}** {COIN} del **{destino.name}** de {usuario.mention}.", ephemeral=False
+        )
+
+    @app_commands.command(name="activar_evento", description="Inicia el ranking de Purple Coins del evento")
+    @is_staff()
+    async def activar_evento(self, interaction: discord.Interaction):
+        if cache.is_evento_activo():
+            return await interaction.response.send_message(
+                "❌ Ya hay un evento de Purple Coins activo.", ephemeral=True
+            )
+
+        await interaction.response.defer(ephemeral=True)
+        await activar_evento_db()
+        await interaction.followup.send(
+            "✅ Evento activado. Desde ahora se registran los cambios de balance para `!evento`.",
+            ephemeral=True,
+        )
+
+    @app_commands.command(name="cerrar_evento", description="Cierra el evento y publica sus resultados")
+    @app_commands.describe(canal_resultados="Canal donde se publicará el Top 10 final")
+    @is_staff()
+    async def cerrar_evento(self, interaction: discord.Interaction, canal_resultados: discord.TextChannel):
+        if not cache.is_evento_activo():
+            return await interaction.response.send_message(
+                "❌ No hay un evento de Purple Coins activo.", ephemeral=True
+            )
+
+        await interaction.response.defer(ephemeral=True)
+        try:
+            await cerrar_evento_db()
+            await flush_evento_puntos()
+            await cache.flush_to_db()
+
+            resultados = cache.get_evento_top(10)
+            if resultados:
+                lineas = []
+                for indice, (user_id, puntos) in enumerate(resultados):
+                    posicion = EVENTO_TOP_ICON if indice < 4 else f"**{indice + 1}.**"
+                    lineas.append(f"{posicion} <@{user_id}> —— {COIN} **{puntos}**")
+                descripcion = "\n".join(lineas)
+            else:
+                descripcion = "No se registraron ingresos durante el evento."
+
+            embed = discord.Embed(
+                title="TOP PURPLE COINS",
+                description=descripcion,
+                color=discord.Color.blue(),
+            )
+            embed.set_footer(text="Retiros del banco y collects no suman puntos.")
+            embed.set_thumbnail(url=EVENTO_THUMBNAIL_URL)
+            await canal_resultados.send(embed=embed)
+            await interaction.followup.send(
+                f"✅ Evento cerrado y resultados publicados en {canal_resultados.mention}.",
+                ephemeral=True,
+            )
+        except Exception:
+            logger.exception("Error cerrando el evento de Purple Coins")
+            await interaction.followup.send(
+                "❌ No se pudieron publicar los resultados del evento.", ephemeral=True
+            )
+
+    @app_commands.command(name="add_xp_laboral", description="Otorga XP Laboral a un usuario de empleos")
+    @app_commands.describe(usuario="Usuario al que asignar XP", xp="Cantidad de XP a otorgar")
+    @is_staff()
+    async def add_xp_laboral(self, interaction: discord.Interaction, usuario: discord.Member, xp: int):
+        if xp <= 0:
+            return await interaction.response.send_message("❌ La cantidad de XP debe ser mayor a 0.", ephemeral=True)
+
+        await interaction.response.defer(ephemeral=False)
+
+        data = await get_empleo_user(usuario.id) or {
+            "user_id": usuario.id,
+            "empleo_actual": None,
+            "dificultad": None,
+            "fecha_contratacion": 0,
+            "ultimo_trabajo": 0,
+            "historial_reciente_de_jornadas": [],
+            "cooldown_renuncia": 0,
+            "progreso_permanencia": 0,
+            "ultimo_empleo": None,
+            "progreso_requisito": 0,
+            "despedido_inactividad": False,
+            "exp_laboral": 0,
+            "trabajos_exitosos": 0,
+            "trabajos_fallidos": 0,
+            "total_generado": 0,
+            "racha_exitos": 0,
+        }
+
+        data["exp_laboral"] = data.get("exp_laboral", 0) + xp
+        await save_empleo_user(data)
+        _EMPLEOS_CACHE.pop(usuario.id, None)
+        data = await get_empleo_user(usuario.id, force_refresh=True) or data
+        _EMPLEOS_CACHE[usuario.id] = data
+
+        await interaction.followup.send(
+            f"✅ Se otorgaron **{xp}** puntos de XP Laboral a {usuario.mention}.",
+            ephemeral=False,
+        )
+
+    @app_commands.command(name="ver_exp_laboral", description="Consulta la EXP laboral de todos los usuarios")
+    @is_staff()
+    async def ver_exp_laboral(self, interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True)
+        rows = await get_all_experiencia_laboral()
+        view = ExperienciaLaboralPaginationView(interaction.user.id, interaction.guild, rows)
+        view.message = await interaction.edit_original_response(
+            embed=await view.get_embed(),
+            view=view,
+        )
+
+    @app_commands.command(name="reset_exp_laboral", description="Reinicia la XP Laboral de un usuario o de todos")
+    @app_commands.describe(
+        alcance="Elige si se reinicia un usuario o todos los registros",
+        usuario="Usuario al que se le reiniciará la XP Laboral",
+    )
+    @app_commands.choices(alcance=[
+        app_commands.Choice(name="Usuario", value="usuario"),
+        app_commands.Choice(name="Todos", value="todos"),
+    ])
+    @is_staff()
+    async def reset_exp_laboral(
+        self,
+        interaction: discord.Interaction,
+        alcance: app_commands.Choice[str],
+        usuario: discord.Member | None = None,
+    ):
+        if alcance.value == "todos":
+            if usuario is not None:
+                return await interaction.response.send_message(
+                    "❌ No selecciones un usuario cuando el alcance sea **Todos**.",
+                    ephemeral=True,
+                )
+            return await interaction.response.send_modal(
+                ResetExpLaboralGlobalModal(interaction.user.id)
+            )
+
+        if usuario is None:
+            return await interaction.response.send_message(
+                "❌ Debes seleccionar un usuario cuando el alcance sea **Usuario**.",
+                ephemeral=True,
+            )
+
+        async with pool.acquire() as conn:
+            user_id = await conn.fetchval(
+                "UPDATE empleos_users SET exp_laboral=0 "
+                "WHERE user_id=$1 AND exp_laboral <> 0 RETURNING user_id",
+                usuario.id,
+            )
+
+        _EMPLEOS_CACHE.pop(usuario.id, None)
+        if user_id is None:
+            return await interaction.response.send_message(
+                f"ℹ️ {usuario.mention} no tiene XP Laboral para reiniciar.",
+                ephemeral=True,
+            )
+        await interaction.response.send_message(
+            f"✅ La XP Laboral de {usuario.mention} fue reiniciada a **0**.",
+            ephemeral=True,
+        )
+
+    @app_commands.command(name="reset_empleos", description="Resetea Empleos y Exp de todos los usuarios de DB.")
+    @is_staff()
+    async def reset_empleos(self, interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True)
+        try:
+            async with pool.acquire() as conn:
+                users_deleted = await conn.fetchval("SELECT COUNT(*) FROM empleos_users")
+                historial_deleted = await conn.fetchval("SELECT COUNT(*) FROM empleos_historial")
+                await conn.execute("DELETE FROM empleos_users")
+                await conn.execute("DELETE FROM empleos_historial")
+
+            _EMPLEOS_CACHE.clear()
+
+            await interaction.followup.send(
+                "✅ Limpieza temporal de empleos completada.\n"
+                f"• Usuarios con empleo limpiados: **{users_deleted or 0}**\n"
+                f"• Registros de historial eliminados: **{historial_deleted or 0}**\n"
+                "• Caché RAM de empleos reiniciada.",
+                ephemeral=True,
+            )
+        except Exception as error:
+            await interaction.followup.send(
+                f"❌ No se pudo completar la limpieza temporal: {error}",
+                ephemeral=True,
+            )
+
+    @app_commands.command(name="resetallcoins", description="Resetea las PurpleCoins de TODOS")
+    @is_staff()
+    async def resetallcoins(self, interaction):
+        await interaction.response.send_modal(ResetAllModal())
+
+    @app_commands.command(name="ruleta_apuesta_max", description="Configura la ruleta")
+    @app_commands.describe(monto="Apuesta máxima", cooldown="Cooldown: ej 30s, 5m, 1h")
+    @is_staff()
+    async def ruleta_apuesta_max(self, interaction, monto: int, cooldown: str):
+        if monto < 100:
+            return await interaction.response.send_message("❌ La apuesta máxima debe ser al menos 100.", ephemeral=True)
+        try:
+            cooldown_seconds = self.parse_cooldown(cooldown)
+        except ValueError:
+            return await interaction.response.send_message(
+                "❌ Formato inválido. Usa ejemplos como: 30s, 5m, 1h", ephemeral=True
+            )
+        ruleta_config["max_apuesta"] = monto
+        ruleta_config["cooldown"] = cooldown_seconds
+        await save_ruleta_config()
+        await clear_game_cooldowns("ruleta")
+        cache.clear_game_cooldowns_cache("ruleta")
+        await interaction.response.send_message(
+            f"✅ Ruleta configurada:\n• Apuesta máxima: **{monto}** {COIN}\n• Cooldown: **{cooldown}**",
+            ephemeral=False
+        )
+
+    @app_commands.command(name="ruleta_alternar", description="Activa o desactiva la ruleta")
+    @is_staff()
+    async def ruleta_alternar(self, interaction):
+        ruleta_config["activa"] = not ruleta_config["activa"]
+        await save_ruleta_config()
+        estado = "✅ activada" if ruleta_config["activa"] else "🔧 desactivada"
+        await interaction.response.send_message(f"La ruleta ha sido **{estado}**.", ephemeral=False)
+
+    @app_commands.command(name="dados_alternar", description="Activa o desactiva el sistema de dados")
+    @is_staff()
+    async def dados_alternar(self, interaction):
+        await interaction.response.defer(ephemeral=False)
+        dados_config["activa"] = not dados_config["activa"]
+        await save_dados_config()
+        estado = "✅ Activado" if dados_config["activa"] else "🔴 Desactivado"
+        await interaction.followup.send(
+            f"🎲 Sistema de Dados: **{estado}**\n"
+            f"📌 Apuesta máxima: **{dados_config['max_apuesta']}** {COIN}\n"
+            f"⏱️ Cooldown: **{self.parse_cooldown_str(dados_config['cooldown'])}**",
+            ephemeral=False,
+        )
+
+    @app_commands.command(name="memo_alternar", description="Activa o desactiva el sistema de memoria")
+    @is_staff()
+    async def memo_alternar(self, interaction):
+        await interaction.response.defer(ephemeral=False)
+        memo_config["activa"] = not memo_config["activa"]
+        await save_memo_config()
+        estado = "✅ Activado" if memo_config["activa"] else "🔴 Desactivado"
+        await interaction.followup.send(
+            f"🧠 Sistema de Memoria: **{estado}**",
+            ephemeral=False,
+        )
+
+    @app_commands.command(name="memo_edit", description="Edita la configuración del sistema de memoria")
+    @app_commands.describe(
+        max_apuesta="Apuesta máxima permitida",
+        cooldown="Cooldown (ej: 60s, 5m, 2h)",
+    )
+    @is_staff()
+    async def memo_edit(self, interaction: discord.Interaction, max_apuesta: int, cooldown: str):
+        if max_apuesta < 100:
+            return await interaction.response.send_message(
+                "❌ La apuesta máxima debe ser al menos 100.",
+                ephemeral=True,
+            )
+        try:
+            cooldown_segundos = self.parse_cooldown(cooldown)
+        except (TypeError, ValueError):
+            return await interaction.response.send_message(
+                "❌ Formato inválido. Usa ejemplos como: 60s, 5m, 2h.",
+                ephemeral=True,
+            )
+        if cooldown_segundos <= 0:
+            return await interaction.response.send_message(
+                "❌ El cooldown debe ser mayor a 0.",
+                ephemeral=True,
+            )
+
+        memo_config["max_apuesta"] = max_apuesta
+        memo_config["cooldown"] = cooldown_segundos
+        await save_memo_config()
+        _memo_cooldowns.clear()
+        await clear_command_cooldowns("memo")
+
+        await interaction.response.send_message(
+            "✅ Memo actualizado:\n"
+            f"• Máx apuesta: **{max_apuesta}** {COIN}\n"
+            f"• Cooldown: **{self.parse_cooldown_str(cooldown_segundos)}**\n"
+            "• Cooldowns activos reiniciados.",
+            ephemeral=False,
+        )
+
+    @app_commands.command(name="bj_alternar", description="Activa o desactiva la mesa de Blackjack")
+    @is_staff()
+    async def bj_alternar(self, interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=False)
+        blackjack_config["activa"] = not blackjack_config["activa"]
+        await save_blackjack_config()
+        estado = "✅ ON" if blackjack_config["activa"] else "🔴 OFF"
+        await interaction.followup.send(
+            f"🃏 Mesa de Blackjack: **{estado}**.",
+            ephemeral=False,
+        )
+
+    @app_commands.command(name="bj_edit", description="Edita la configuración del Blackjack")
+    @app_commands.describe(
+        max_apuesta="Apuesta máxima permitida",
+        cooldown="Cooldown (ej: 30s, 5m, 2h)",
+    )
+    @is_staff()
+    async def bj_edit(
+        self,
+        interaction: discord.Interaction,
+        max_apuesta: int,
+        cooldown: str,
+    ):
+        try:
+            cooldown_segundos = self.parse_cooldown(cooldown)
+        except (TypeError, ValueError):
+            return await interaction.response.send_message(
+                "❌ Formato inválido. Usa ejemplos como: 30s, 5m, 2h.",
+                ephemeral=True,
+            )
+
+        if max_apuesta < 100:
+            return await interaction.response.send_message(
+                "❌ La apuesta máxima debe ser al menos 100.",
+                ephemeral=True,
+            )
+        if cooldown_segundos <= 0:
+            return await interaction.response.send_message(
+                "❌ El cooldown debe ser mayor a 0.",
+                ephemeral=True,
+            )
+        blackjack_config["max_apuesta"] = max_apuesta
+        blackjack_config["cooldown"] = cooldown_segundos
+        await save_blackjack_config()
+        await clear_game_cooldowns("bj")
+        cache.clear_game_cooldowns_cache("bj")
+
+        await interaction.response.send_message(
+            "✅ Blackjack actualizado:\n"
+            f"• Máx apuesta: **{max_apuesta}** {COIN}\n"
+            f"• Cooldown: **{self.parse_cooldown_str(cooldown_segundos)}**\n"
+            "• Pago normal: **1:1** | Blackjack natural: **3:2**\n"
+            "• Cooldowns activos reiniciados.",
+            ephemeral=False,
+        )
+
+    @app_commands.command(name="golpear_alternar", description="Activa o desactiva el sistema de cofres")
+    @is_staff()
+    async def golpear_alternar(self, interaction):
+        await interaction.response.defer(ephemeral=False)
+        import sys
+        gmod = sys.modules["modules.golpear"]
+        cfg = gmod._golpear_config
+        nuevo_activo = not cfg["activo"]
+
+        from core.database import save_golpear_config
+        await save_golpear_config(
+            cfg["canal_id"], cfg["min_time"], cfg["max_time"],
+            cfg["min_ganancia"], cfg["max_ganancia"], nuevo_activo,
+            0,
+        )
+        cfg["activo"] = nuevo_activo
+        cfg["next_spawn_at"] = 0.0
+        gmod.señalar_cambio()
+
+        estado = "✅ Activado" if cfg["activo"] else "🔴 Desactivado"
+        canal = self.bot.get_channel(cfg["canal_id"]) if cfg["canal_id"] else None
+        canal_txt = canal.mention if canal else f"<#{cfg['canal_id']}>" if cfg["canal_id"] else "No configurado"
+
+        embed = discord.Embed(
+            title=f"💥 Sistema de Cofres: {estado}",
+            color=discord.Color.green() if cfg["activo"] else discord.Color.red(),
+            description=(
+                f"📌 **Canal**: {canal_txt}\n"
+                f"⏱️ **Intervalo**: **{self.parse_cooldown_str(cfg['min_time'])}** — **{self.parse_cooldown_str(cfg['max_time'])}**\n"
+                f"💰 **Ganancias**: **{cfg['min_ganancia']}** — **{cfg['max_ganancia']}** {COIN}\n"
+                f"👤 **Activado por**: {interaction.user.mention}"
+            )
+        )
+        await interaction.followup.send(embed=embed, ephemeral=False)
+
+    @app_commands.command(
+        name="golpear_estado",
+        description="Muestra configuración, permisos y salud del sistema de cofres",
+    )
+    @is_staff()
+    async def golpear_estado(self, interaction):
+        await interaction.response.defer(ephemeral=True)
+        import sys
+
+        gmod = sys.modules["modules.golpear"]
+        cfg = gmod._golpear_config
+        health = gmod._loop_health
+        task = gmod._loop_task
+
+        canal = self.bot.get_channel(cfg["canal_id"]) if cfg["canal_id"] else None
+        canal_txt = canal.mention if canal else (
+            f"<#{cfg['canal_id']}> (no resuelto)" if cfg["canal_id"] else "No configurado"
+        )
+        permisos_txt = "No comprobables"
+        if isinstance(canal, discord.TextChannel) and canal.guild.me is not None:
+            faltantes = gmod.permisos_faltantes(canal, canal.guild.me)
+            permisos_txt = "✅ Correctos" if not faltantes else "❌ " + ", ".join(faltantes)
+
+        tarea_activa = bool(task and not task.done())
+        next_spawn_at = float(cfg.get("next_spawn_at") or 0)
+        proximo_txt = (
+            f"<t:{int(next_spawn_at)}:R>"
+            if cfg["activo"] and next_spawn_at > time.time()
+            else "Aún no programado"
+        )
+        ultimo_spawn = float(health.get("ultimo_spawn") or 0)
+        ultimo_spawn_txt = (
+            f"<t:{int(ultimo_spawn)}:R>" if ultimo_spawn else "No registrado desde este inicio"
+        )
+        ultimo_error = health.get("ultimo_error") or "Ninguno"
+
+        embed = discord.Embed(
+            title="💥 Diagnóstico del Sistema de Cofres",
+            color=discord.Color.green() if cfg["activo"] and tarea_activa else discord.Color.orange(),
+            description=(
+                f"**Sistema:** {'✅ ON' if cfg['activo'] else '🔴 OFF'}\n"
+                f"**Worker:** {'✅ Ejecutándose' if tarea_activa else '❌ Detenido'}\n"
+                f"**Estado interno:** `{health.get('estado', 'desconocido')}`\n"
+                f"**Canal:** {canal_txt}\n"
+                f"**Permisos:** {permisos_txt}\n"
+                f"**Intervalo:** {self.parse_cooldown_str(cfg['min_time'])} — "
+                f"{self.parse_cooldown_str(cfg['max_time'])}\n"
+                f"**Próximo cofre:** {proximo_txt}\n"
+                f"**Último cofre:** {ultimo_spawn_txt}\n"
+                f"**Último error:** `{str(ultimo_error)[:800]}`"
+            ),
+        )
+        await interaction.followup.send(embed=embed, ephemeral=True)
+
+    @app_commands.command(
+        name="golpear_forzar",
+        description="Publica un cofre de prueba inmediatamente en el canal configurado",
+    )
+    @is_staff()
+    async def golpear_forzar(self, interaction):
+        await interaction.response.defer(ephemeral=True)
+        import sys
+
+        gmod = sys.modules["modules.golpear"]
+        cfg = gmod._golpear_config
+        canal_id = cfg.get("canal_id")
+        if not canal_id:
+            return await interaction.followup.send(
+                "❌ El canal fijo del sistema de cofres no está disponible.",
+                ephemeral=True,
+            )
+
+        try:
+            canal = self.bot.get_channel(canal_id) or await self.bot.fetch_channel(canal_id)
+            if not isinstance(canal, discord.TextChannel):
+                raise TypeError("el destino configurado no es un canal de texto")
+            if canal.guild.me is None:
+                raise RuntimeError("no se pudo resolver al miembro del bot")
+            faltantes = gmod.permisos_faltantes(canal, canal.guild.me)
+            if faltantes:
+                return await interaction.followup.send(
+                    "❌ No puedo publicar el cofre. Permisos faltantes: "
+                    f"**{', '.join(faltantes)}**.",
+                    ephemeral=True,
+                )
+            await gmod.spawn_cofre(canal)
+            gmod._loop_health["ultimo_spawn"] = time.time()
+            gmod._loop_health["ultimo_error"] = None
+        except Exception as error:
+            gmod._loop_health["ultimo_error"] = f"{type(error).__name__}: {error}"
+            logger.exception(
+                "[COFRES:E_FORCE] Falló la publicación manual en el canal %s",
+                canal_id,
+            )
+            return await interaction.followup.send(
+                f"❌ Falló la prueba: `{type(error).__name__}: {str(error)[:500]}`",
+                ephemeral=True,
+            )
+
+        await interaction.followup.send(
+            f"✅ Cofre de prueba publicado correctamente en {canal.mention}.",
+            ephemeral=True,
+        )
+
+    @app_commands.command(name="golpear_editar", description="Configura las ganancias del sistema de cofres")
+    @app_commands.describe(
+        min_ganancia="Ganancia mínima por cofre",
+        max_ganancia="Ganancia máxima por cofre"
+    )
+    @is_staff()
+    async def golpear_editar(
+        self,
+        interaction: discord.Interaction,
+        min_ganancia: int = None,
+        max_ganancia: int = None,
+    ):
+        await interaction.response.defer(ephemeral=True)
+        import sys
+        gmod = sys.modules["modules.golpear"]
+        cfg = gmod._golpear_config
+        canal_id = gmod.GOLPEAR_CHANNEL_ID
+        min_seconds = gmod.GOLPEAR_MIN_TIME
+        max_seconds = gmod.GOLPEAR_MAX_TIME
+
+        # Validar ganancias si se proporcionan
+        if min_ganancia is None:
+            min_ganancia = cfg.get("min_ganancia", 150)
+        if max_ganancia is None:
+            max_ganancia = cfg.get("max_ganancia", 800)
+
+        if min_ganancia <= 0 or max_ganancia <= 0:
+            return await interaction.followup.send("❌ Las ganancias deben ser mayores a 0.", ephemeral=True)
+        if min_ganancia >= max_ganancia:
+            return await interaction.followup.send("❌ La ganancia mínima debe ser menor a la máxima.", ephemeral=True)
+
+        try:
+            canal = self.bot.get_channel(canal_id) or await self.bot.fetch_channel(canal_id)
+        except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+            return await interaction.followup.send(
+                f"❌ No pude acceder al canal fijo <#{canal_id}>.",
+                ephemeral=True,
+            )
+        if not isinstance(canal, discord.TextChannel):
+            return await interaction.followup.send(
+                f"❌ El destino fijo <#{canal_id}> no es un canal de texto.",
+                ephemeral=True,
+            )
+
+        bot_member = canal.guild.me
+        if bot_member is None:
+            return await interaction.followup.send(
+                "❌ No pude comprobar los permisos del bot en ese servidor.",
+                ephemeral=True,
+            )
+        faltantes = gmod.permisos_faltantes(canal, bot_member)
+        if faltantes:
+            return await interaction.followup.send(
+                "❌ No puedo usar ese canal para los cofres. Permisos faltantes: "
+                f"**{', '.join(faltantes)}**.",
+                ephemeral=True,
+            )
+
+        from core.database import save_golpear_config
+        await save_golpear_config(
+            canal_id, min_seconds, max_seconds,
+            min_ganancia, max_ganancia, cfg["activo"],
+            0,
+        )
+        cfg["canal_id"] = canal_id
+        cfg["min_time"] = min_seconds
+        cfg["max_time"] = max_seconds
+        cfg["min_ganancia"] = min_ganancia
+        cfg["max_ganancia"] = max_ganancia
+        cfg["next_spawn_at"] = 0.0
+        gmod.señalar_cambio()
+
+        await interaction.followup.send(
+            f"✅ Sistema de Cofres configurado:\n"
+            f"📌 Canal: {canal.mention}\n"
+            f"⏱️ Intervalo: **{self.parse_cooldown_str(min_seconds)}** — **{self.parse_cooldown_str(max_seconds)}**\n"
+            f"💰 Ganancias: **{min_ganancia}** — **{max_ganancia}** {COIN}",
+            ephemeral=True,
+        )
+
+    @app_commands.command(name="add_craft", description="Agrega un artículo al crafteo de Halloween")
+    @app_commands.describe(
+        item_name="Nombre del artículo",
+        precio="Costo en dulces",
+        icon="Emoji que se mostrará junto al artículo",
+        descripcion="Descripción breve del artículo",
+    )
+    @is_staff()
+    async def add_craft(
+        self,
+        interaction: discord.Interaction,
+        item_name: str,
+        precio: int,
+        icon: str,
+        descripcion: str,
+    ):
+        nombre = item_name.strip()
+        icono = icon.strip()
+        descripcion = descripcion.strip()
+        if not nombre or not icono or not descripcion or precio <= 0:
+            return await interaction.response.send_message(
+                "❌ Completa nombre, icono y descripción; el precio debe ser mayor que cero.",
+                ephemeral=True,
+            )
+        if len(nombre) > 80 or len(icono) > 100 or len(descripcion) > 300:
+            return await interaction.response.send_message(
+                "❌ Límite: nombre 80, icono 100 y descripción 300 caracteres.",
+                ephemeral=True,
+            )
+        await interaction.response.defer(ephemeral=True)
+        try:
+            created = await add_craft_item(nombre, precio, icono, descripcion)
+        except Exception:
+            logger.exception("No se pudo agregar el artículo de crafteo %r", nombre)
+            return await interaction.followup.send(
+                "❌ No pude crear el artículo. Inténtalo de nuevo.", ephemeral=True,
+            )
+        if not created:
+            return await interaction.followup.send(
+                f"❌ Ya existe un artículo de crafteo llamado **{nombre}**.", ephemeral=True,
+            )
+        await interaction.followup.send(
+            f"✅ **{nombre}** añadido al crafteo por **{precio}** dulces.", ephemeral=True,
+        )
+
+    @app_commands.command(name="delete_craft", description="Retira un artículo del crafteo de Halloween")
+    @app_commands.describe(item="Selecciona el artículo que deseas retirar")
+    @is_staff()
+    async def delete_craft(self, interaction: discord.Interaction, item: str):
+        try:
+            item_id = int(item)
+        except ValueError:
+            return await interaction.response.send_message(
+                "❌ Selecciona un artículo del desplegable.", ephemeral=True,
+            )
+        await interaction.response.defer(ephemeral=True)
+        try:
+            nombre = await delete_craft_item(item_id)
+        except Exception:
+            logger.exception("No se pudo retirar el artículo de crafteo %s", item_id)
+            return await interaction.followup.send(
+                "❌ No pude retirar el artículo. Inténtalo de nuevo.", ephemeral=True,
+            )
+        if nombre is None:
+            return await interaction.followup.send(
+                "❌ Ese artículo ya no está disponible en el crafteo.", ephemeral=True,
+            )
+        await interaction.followup.send(
+            f"✅ **{nombre}** retirado del crafteo. "
+            "Las unidades ya canjeadas permanecen en los inventarios.",
+            ephemeral=True,
+        )
+
+    @delete_craft.autocomplete("item")
+    async def delete_craft_autocomplete(
+        self, interaction: discord.Interaction, current: str,
+    ):
+        try:
+            items = await get_craft_items()
+        except Exception:
+            logger.exception("No se pudo cargar el desplegable de /delete_craft")
+            return []
+        filtro = current.casefold().strip()
+        return [
+            app_commands.Choice(
+                name=f"{item['icono'] or '🎁'} {item['nombre']} · {item['precio']} dulces"[:100],
+                value=str(item["id"]),
+            )
+            for item in items
+            if filtro in item["nombre"].casefold()
+        ][:25]
+
+    # ── ADD ITEM (nuevo flujo: campos de texto directos) ───
+    @app_commands.command(name="add_item", description="Agrega un nuevo item a la tienda")
+    @app_commands.describe(
+        nombre="Nombre del item",
+        desc="Descripción corta (visible en !tienda)",
+        precio="Precio en PurpleCoins",
+        stock="Stock total (-1 = ilimitado)",
+        icono="Emoji del servidor o unicode. Ej: <:nombre:123456> o 🌟",
+        desc_larga="Descripción larga visible en !info. Opcional.",
+        rol="Rol que se otorga al usar el item. Opcional.",
+        duracion_rol="Duración del rol: ej 30m, 12h, 7d. Vacío = permanente. Opcional.",
+        cantid_por_user="Límite de compras por usuario. Vacío = ilimitado. Opcional.",
+        mensaje_uso="Mensaje al usar el item en !inv. Vacío = mensaje por defecto. Opcional.",
+        limite_uso="Máximo de usos por día por usuario. Ej: 1. Vacío = sin límite. Opcional.",
+        cd_boost="Reduce 50% los cooldowns compatibles durante 180 minutos.",
+        caduca="Vencimiento tras comprar: solo días, ej. 5d. Vacío = no caduca."
+    )
+    @is_staff()
+    async def item_new(self, interaction,
+                       nombre: str,
+                       desc: str,
+                       precio: int,
+                       stock: int,
+                       icono: str = "",
+                       desc_larga: str = "",
+                       rol: discord.Role = None,
+                       duracion_rol: str = "",
+                       cantid_por_user: int = 0,
+                       mensaje_uso: str = "",
+                       limite_uso: int = 0,
+                       cd_boost: bool = False,
+                       caduca: str = ""):
+
+        if precio <= 0:
+            return await interaction.response.send_message("❌ El precio debe ser mayor a 0.", ephemeral=True)
+
+        caduca_dias = 0
+        if caduca.strip():
+            valor_caduca = caduca.strip().lower()
+            if not re.fullmatch(r"[1-9]\d*d", valor_caduca):
+                return await interaction.response.send_message(
+                    "❌ El vencimiento debe estar expresado solo en días. Ejemplo: `5d`.",
+                    ephemeral=True,
+                )
+            caduca_dias = int(valor_caduca[:-1])
+
+        # Parsear duración antes del defer para validar formato
+        duracion_segundos = 0
+        if duracion_rol:
+            try:
+                val = duracion_rol.strip().lower()
+                if val.endswith("d"):
+                    duracion_segundos = int(val[:-1]) * 86400
+                elif val.endswith("h"):
+                    duracion_segundos = int(val[:-1]) * 3600
+                elif val.endswith("m"):
+                    duracion_segundos = int(val[:-1]) * 60
+                else:
+                    return await interaction.response.send_message(
+                        "❌ Formato de duración inválido. Usa: 30m, 12h, 7d", ephemeral=True
+                    )
+            except ValueError:
+                return await interaction.response.send_message(
+                    "❌ Duración inválida.", ephemeral=True
+                )
+
+        await interaction.response.defer(ephemeral=False)
+
+        existing = await get_item_by_name(nombre.strip())
+        if existing:
+            return await interaction.followup.send(
+                f"❌ Ya existe un item llamado **{nombre}**.", ephemeral=True
+            )
+
+        rol_id = rol.id if rol else None
+
+        await add_item(
+            nombre=nombre.strip(),
+            descripcion=desc.strip(),
+            descripcion_larga=desc_larga.strip(),
+            precio=precio,
+            cantidad=1,
+            stock=stock,
+            icono=icono.strip(),
+            utilizable=True,
+            mensaje_uso=mensaje_uso.strip(),
+            rol_id=rol_id,
+            duracion=duracion_segundos,
+            limite_por_usuario=cantid_por_user if cantid_por_user > 0 else 0,
+            limite_uso=limite_uso if limite_uso > 0 else 0,
+            cd_boost=cd_boost,
+            caduca_dias=caduca_dias,
+        )
+
+        dur_txt = duracion_rol if duracion_rol else "Permanente"
+        rol_txt = rol.mention if rol else "Ninguno"
+        icono_display = icono if icono else "🔹"
+        limite_txt = str(cantid_por_user) if cantid_por_user > 0 else "∞"
+        limite_uso_txt = str(limite_uso) if limite_uso > 0 else "∞"
+        caduca_txt = f"{caduca_dias} día(s) desde cada compra" if caduca_dias else "No caduca"
+
+        uso_txt = mensaje_uso.strip() if mensaje_uso.strip() else "Mensaje por defecto"
+        await interaction.followup.send(
+            f"✅ Item **{icono_display} {nombre}** añadido a la tienda.\n"
+            f"• Precio: **{precio}** {COIN}\n"
+            f"• Stock total: **{'∞' if stock == -1 else stock}**\n"
+            f"• Límite por usuario: **{limite_txt}**\n"
+            f"• Usos por día: **{limite_uso_txt}**\n"
+            f"• CD Boost: **{'Sí' if cd_boost else 'No'}**\n"
+            f"• Vencimiento: **{caduca_txt}**\n"
+            f"• Rol: {rol_txt}  •  Duración: {dur_txt}\n"
+            f"• Mensaje de uso: {uso_txt}",
+            ephemeral=False
+        )
+
+    @app_commands.command(name="editar_item", description="Edita un item de la tienda")
+    @app_commands.describe(
+        item="Selecciona el item a editar",
+        nuevo_nombre="Nuevo nombre. Vacío = sin cambio. Opcional.",
+        nuevo_precio="Nuevo precio. Vacío = sin cambio. Opcional.",
+        nueva_desc="Nueva descripción corta. Vacío = sin cambio. Opcional.",
+        nuevo_icono="Emoji del servidor o unicode. Vacío = sin cambio. Opcional.",
+        nuevo_mensaje_uso="Nuevo mensaje al usar el item. Vacío = sin cambio. Opcional.",
+        cantidad_por_user="Límite de compras por usuario. 0 = ilimitado. Opcional.",
+        limite_uso="Máximo de usos diarios por usuario. 0 = ilimitado. Opcional.",
+        cd_boost="Activa o desactiva la reducción temporal de cooldowns."
+    )
+    @is_staff()
+    async def editar_item(self, interaction,
+                          item: str,
+                          nuevo_nombre: str = "",
+                          nuevo_precio: int = None,
+                          nueva_desc: str = "",
+                          nuevo_icono: str = "",
+                          nuevo_mensaje_uso: str = "",
+                          cantidad_por_user: int = None,
+                          limite_uso: int = None,
+                          cd_boost: bool = None):
+
+        await interaction.response.defer()
+
+        try:
+            found = await get_item_by_name(item.strip())
+            if not found:
+                return await interaction.followup.send(
+                    f"❌ Item **{item}** no encontrado.", ephemeral=True
+                )
+
+            if cantidad_por_user is not None and cantidad_por_user < 0:
+                return await interaction.followup.send(
+                    "❌ La cantidad por usuario no puede ser negativa.", ephemeral=True
+                )
+            if limite_uso is not None and limite_uso < 0:
+                return await interaction.followup.send(
+                    "❌ El límite de uso no puede ser negativo.", ephemeral=True
+                )
+
+            if not any([
+                nuevo_nombre, nuevo_precio is not None, nueva_desc, nuevo_icono, nuevo_mensaje_uso,
+                cantidad_por_user is not None, limite_uso is not None,
+                cd_boost is not None,
+            ]):
+                return await interaction.followup.send(
+                    "❌ Debes cambiar al menos un campo.", ephemeral=True
+                )
+
+            nombre = nuevo_nombre.strip() or None
+            precio = nuevo_precio if nuevo_precio is not None else None
+            desc = nueva_desc.strip() or None
+            icono_nuevo = nuevo_icono.strip() or None
+            msg_uso = nuevo_mensaje_uso.strip() if nuevo_mensaje_uso.strip() else None
+
+            await edit_item(
+                found["id"], nombre=nombre, precio=precio, descripcion=desc,
+                mensaje_uso=msg_uso, limite_por_usuario=cantidad_por_user,
+                limite_uso=limite_uso, cd_boost=cd_boost, icono=icono_nuevo,
+            )
+
+            cambios = []
+            if nombre:
+                cambios.append(f"• Nombre: **{found['nombre']}** → **{nombre}**")
+            if precio is not None:
+                cambios.append(f"• Precio: **{found['precio']}** → **{precio}** {COIN}")
+            if desc:
+                cambios.append(f"• Descripción: **{desc}**")
+            if icono_nuevo is not None:
+                icono_anterior = found["icono"] or "🔹"
+                cambios.append(f"• Icono: {icono_anterior} → {icono_nuevo}")
+            if msg_uso is not None:
+                cambios.append(f"• Mensaje de uso: **{msg_uso}**")
+            if cantidad_por_user is not None:
+                limite_anterior = found.get("limite_por_usuario", 0) or 0
+                limite_nuevo = cantidad_por_user if cantidad_por_user > 0 else "∞"
+                limite_anterior = limite_anterior if limite_anterior > 0 else "∞"
+                cambios.append(f"• Límite por usuario: **{limite_anterior}** → **{limite_nuevo}**")
+            if limite_uso is not None:
+                usos_anteriores = found.get("limite_uso", 0) or 0
+                usos_nuevos = limite_uso if limite_uso > 0 else "∞"
+                usos_anteriores = usos_anteriores if usos_anteriores > 0 else "∞"
+                cambios.append(f"• Usos por día: **{usos_anteriores}** → **{usos_nuevos}**")
+            if cd_boost is not None:
+                boost_anterior = "Sí" if found.get("cd_boost", False) else "No"
+                boost_nuevo = "Sí" if cd_boost else "No"
+                cambios.append(f"• CD Boost: **{boost_anterior}** → **{boost_nuevo}**")
+
+            icono = icono_nuevo or found["icono"] or "🔹"
+            await interaction.followup.send(
+                f"✅ Item **{icono} {found['nombre']}** actualizado:\n" + "\n".join(cambios),
+                ephemeral=False
+            )
+        except Exception as e:
+            logger.error(f"ERROR editar_item: {e}")
+            return await interaction.followup.send(
+                "❌ Ocurrió un error al editar el item. Intenta de nuevo más tarde.",
+                ephemeral=True
+            )
+    @editar_item.autocomplete("item")
+    async def editar_item_autocomplete(self, interaction: discord.Interaction, current: str):
+        items = cache.get_items_cache()
+        return [
+            app_commands.Choice(name=i["nombre"], value=i["nombre"])
+            for i in items
+            if current.lower() in i["nombre"].lower()
+        ][:25]
+
+    @app_commands.command(name="configurar_log_item", description="Configura el log de uso especial para un item")
+    @app_commands.describe(
+        item="Item cuyo uso se registrará también en un canal especial",
+        canal="Canal donde se mencionará al staff al usar el item",
+    )
+    @is_staff()
+    async def configurar_log_item(
+        self,
+        interaction: discord.Interaction,
+        item: str,
+        canal: discord.TextChannel,
+    ):
+        found = await get_item_by_name(item.strip())
+        if not found:
+            return await interaction.response.send_message(
+                f"❌ Item **{item}** no encontrado.", ephemeral=True
+            )
+
+        await set_item_log_uso_channel(found["id"], canal.id)
+        icono = found["icono"] if found["icono"] else "🔹"
+        await interaction.response.send_message(
+            f"✅ El uso de {icono} **{found['nombre']}** también se registrará en {canal.mention} "
+            "mencionando al staff.",
+            ephemeral=True,
+        )
+
+    @configurar_log_item.autocomplete("item")
+    async def configurar_log_item_autocomplete(
+        self, interaction: discord.Interaction, current: str
+    ):
+        return [
+            app_commands.Choice(name=item["nombre"], value=item["nombre"])
+            for item in cache.get_items_cache()
+            if current.lower() in item["nombre"].lower()
+        ][:25]
+
+    @app_commands.command(name="eliminar_log_item", description="Quita el log de uso especial de un item")
+    @app_commands.describe(item="Item al que se le quitará el canal especial")
+    @is_staff()
+    async def eliminar_log_item(self, interaction: discord.Interaction, item: str):
+        found = await get_item_by_name(item.strip())
+        if not found:
+            return await interaction.response.send_message(
+                f"❌ Item **{item}** no encontrado.", ephemeral=True
+            )
+        if found.get("log_uso_channel_id") is None:
+            return await interaction.response.send_message(
+                f"❌ **{found['nombre']}** no tiene un log de uso especial configurado.",
+                ephemeral=True,
+            )
+
+        await set_item_log_uso_channel(found["id"], None)
+        await interaction.response.send_message(
+            f"✅ El log de uso especial de **{found['nombre']}** fue eliminado.",
+            ephemeral=True,
+        )
+
+    @eliminar_log_item.autocomplete("item")
+    async def eliminar_log_item_autocomplete(
+        self, interaction: discord.Interaction, current: str
+    ):
+        return [
+            app_commands.Choice(name=item["nombre"], value=item["nombre"])
+            for item in cache.get_items_cache()
+            if current.lower() in item["nombre"].lower()
+        ][:25]
+
+    @app_commands.command(name="eliminar_item", description="Elimina un item de la tienda")
+    @app_commands.describe(item="Selecciona el item a eliminar")
+    @is_staff()
+    async def eliminar_item(self, interaction, item: str):
+        await interaction.response.defer(ephemeral=False)
+        found = await get_item_by_name(item.strip())
+        if not found:
+            return await interaction.followup.send(
+                f"❌ Item **{item}** no encontrado.", ephemeral=True
+            )
+        await delete_item(found["id"])
+        icono = found["icono"] if found["icono"] else "🔹"
+        await interaction.followup.send(
+            f"✅ Item **{icono} {found['nombre']}** eliminado de la tienda.",
+            ephemeral=False
+        )
+
+    @eliminar_item.autocomplete("item")
+    async def eliminar_item_autocomplete(self, interaction: discord.Interaction, current: str):
+        items = cache.get_items_cache()
+        return [
+            app_commands.Choice(name=i['nombre'], value=i['nombre'])
+            for i in items
+            if current.lower() in i['nombre'].lower()
+        ][:25]
+
+    @app_commands.command(name="dropar_item", description="Agrega un item de la tienda al inventario de un usuario")
+    @app_commands.describe(
+        usuario="Selecciona el usuario destinatario",
+        item="Selecciona el item a dropar",
+        cantidad="Cantidad a agregar"
+    )
+    @is_staff()
+    async def dropar_item(self, interaction, usuario: discord.Member, item: str, cantidad: int):
+        if cantidad <= 0:
+            return await interaction.response.send_message(
+                "❌ La cantidad debe ser mayor a 0.", ephemeral=True
+            )
+        await interaction.response.defer(ephemeral=False)
+        found = await get_item_by_name(item.strip())
+        if not found:
+            return await interaction.followup.send(
+                f"❌ Item **{item}** no encontrado.", ephemeral=True
+            )
+        result = await add_to_inventory(usuario.id, found["id"], cantidad)
+        if not result["ok"]:
+            if result["reason"] == "inventory_cap":
+                return await interaction.followup.send(
+                    f"❌ El inventario no puede superar **x{result['limit']}** "
+                    f"de **{found['nombre']}**.",
+                    ephemeral=True,
+                )
+            return await interaction.followup.send(
+                "❌ No se pudo agregar esa cantidad al inventario.",
+                ephemeral=True,
+            )
+        icono = found["icono"] if found["icono"] else "🔹"
+        await interaction.followup.send(
+            f"✅ Se han agregado {cantidad}x {icono} {found['nombre']} al inventario de {usuario.mention}.",
+            ephemeral=False
+        )
+
+    @dropar_item.autocomplete("item")
+    async def dropar_item_autocomplete(self, interaction: discord.Interaction, current: str):
+        items = cache.get_items_cache()
+        return [
+            app_commands.Choice(name=i["nombre"], value=i["nombre"])
+            for i in items
+            if current.lower() in i["nombre"].lower()
+        ][:25]
+
+    @app_commands.command(name="remover_item", description="Remueve un item del inventario de un usuario")
+    @app_commands.describe(
+        usuario="Selecciona el usuario afectado",
+        item="Selecciona el item a remover",
+        cantidad="Cantidad a remover",
+    )
+    @is_staff()
+    async def remover_item(self, interaction, usuario: discord.Member, item: str, cantidad: int):
+        if cantidad <= 0:
+            return await interaction.response.send_message(
+                "❌ La cantidad debe ser mayor a 0.", ephemeral=True
+            )
+
+        await interaction.response.defer(ephemeral=False)
+        found = await get_item_by_name(item.strip())
+        if not found:
+            return await interaction.followup.send(
+                f"❌ Item **{item}** no encontrado.", ephemeral=True
+            )
+
+        result = await remove_inventory_quantity(usuario.id, found["id"], cantidad)
+        if not result["ok"]:
+            disponible = result.get("available", 0)
+            return await interaction.followup.send(
+                f"❌ {usuario.mention} solo posee **{disponible}x** de **{found['nombre']}**.",
+                ephemeral=True,
+            )
+
+        icono = found["icono"] if found["icono"] else "🔹"
+        await interaction.followup.send(
+            f"✅ Se han removido {cantidad}x {icono} {found['nombre']} del inventario de {usuario.mention}.\n"
+            f"• Cantidad restante: **{result['remaining']}**",
+            ephemeral=False,
+        )
+
+    @remover_item.autocomplete("item")
+    async def remover_item_autocomplete(self, interaction: discord.Interaction, current: str):
+        items = cache.get_items_cache()
+        return [
+            app_commands.Choice(name=i["nombre"], value=i["nombre"])
+            for i in items
+            if current.lower() in i["nombre"].lower()
+        ][:25]
+
+    @app_commands.command(name="economia", description="Examina la economía completa")
+    @is_staff()
+    async def economia(self, interaction: discord.Interaction):
+        embed = discord.Embed(
+            title="📊 Economía",
+            description="Selecciona una opción para examinar la economía de PurpleJack.",
+            color=discord.Color.dark_purple()
+        )
+        await interaction.response.send_message(
+            embed=embed,
+            view=EconomiaView(interaction.user.id),
+            ephemeral=True
+        )
+
+    @app_commands.command(name="stock_add", description="Añade stock a un item de la tienda")
+    @app_commands.describe(nombre="Selecciona el item", cantidad="Cantidad de stock a añadir")
+    @is_staff()
+    async def stock_add(self, interaction, nombre: str, cantidad: int):
+        if cantidad <= 0:
+            return await interaction.response.send_message("❌ La cantidad debe ser mayor a 0.", ephemeral=True)
+        await interaction.response.defer(ephemeral=False)
+        item = await get_item_by_name(nombre.strip())
+        if not item:
+            return await interaction.followup.send(f"❌ Item **{nombre}** no encontrado.", ephemeral=True)
+        stock_actualizado = await add_stock(item["id"], cantidad)
+        if stock_actualizado is None:
+            return await interaction.followup.send(
+                f"❌ Item **{item['nombre']}** no encontrado.",
+                ephemeral=True,
+            )
+        stock_anterior, nuevo_stock = stock_actualizado
+        if stock_anterior == -1:
+            mensaje = (
+                f"✅ **{item['nombre']}** cambió de stock infinito a stock limitado: "
+                f"`∞` → `{nuevo_stock}`"
+            )
+        else:
+            mensaje = (
+                f"✅ Stock de **{item['nombre']}** actualizado: "
+                f"`{stock_anterior}` → `{nuevo_stock}`"
+            )
+        await interaction.followup.send(
+            mensaje,
+            ephemeral=False
+        )
+
+    @stock_add.autocomplete("nombre")
+    async def stock_add_autocomplete(self, interaction: discord.Interaction, current: str):
+        items = cache.get_items_cache()
+        return [
+            app_commands.Choice(name=i["nombre"], value=i["nombre"])
+            for i in items
+            if current.lower() in i["nombre"].lower()
+        ][:25]
+
+    @app_commands.command(
+        name="stock_list",
+        description="Muestra el stock de tienda y el total guardado en inventarios",
+    )
+    @is_staff()
+    async def stock_list(self, interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True)
+        try:
+            rows = await get_stock_inventory_summary()
+            if not rows:
+                return await interaction.followup.send(
+                    "📦 No hay items registrados en la tienda.",
+                    ephemeral=True,
+                )
+
+            view = StockListPaginationView(interaction.user.id, rows)
+            await interaction.edit_original_response(embed=view.get_embed(), view=view)
+            view.message = await interaction.original_response()
+        except Exception:
+            logger.exception("ERROR stock_list")
+            await interaction.followup.send(
+                "❌ No pude consultar el stock en este momento.",
+                ephemeral=True,
+            )
+
+    @app_commands.command(name="collect_config", description="Configura collect para un rol")
+    @app_commands.describe(rol="Rol", cantidad="PurpleCoins a otorgar", cooldown="Cooldown: ej 2h o 30m")
+    @is_staff()
+    async def collect_config(self, interaction, rol: discord.Role, cantidad: int, cooldown: str):
+        if cantidad <= 0:
+            return await interaction.response.send_message("❌ Cantidad debe ser mayor a 0.", ephemeral=True)
+        cooldown = cooldown.strip().lower()
+        if cooldown.endswith("h"):
+            try:
+                cooldown_horas = int(cooldown[:-1])
+            except ValueError:
+                return await interaction.response.send_message("❌ Formato inválido. Usa: 2h o 30m", ephemeral=True)
+        elif cooldown.endswith("m"):
+            try:
+                minutos = int(cooldown[:-1])
+                cooldown_horas = minutos / 60
+            except ValueError:
+                return await interaction.response.send_message("❌ Formato inválido. Usa: 2h o 30m", ephemeral=True)
+        else:
+            return await interaction.response.send_message("❌ Formato inválido. Usa: 2h o 30m", ephemeral=True)
+
+        if cooldown_horas <= 0:
+            return await interaction.response.send_message("❌ El cooldown debe ser mayor a 0.", ephemeral=True)
+
+        await upsert_collect_config_db(rol.id, cantidad, cooldown_horas)
+        await interaction.response.send_message(
+            f"✅ Collect configurado: {rol.mention} → {COIN} **{cantidad}** cada **{cooldown}**.", ephemeral=False
+        )
+
+    @app_commands.command(name="collect_eliminar", description="Elimina el collect de un rol")
+    @app_commands.describe(rol="Rol a eliminar")
+    @is_staff()
+    async def collect_eliminar(self, interaction, rol: discord.Role):
+        config = cache.get_collect_config()
+        if rol.id not in config:
+            return await interaction.response.send_message(f"❌ {rol.mention} no tiene collect configurado.", ephemeral=True)
+        await delete_collect_config_db(rol.id)
+        await interaction.response.send_message(f"✅ Collect de {rol.mention} eliminado.", ephemeral=False)
+
+    @app_commands.command(name="restringir_usar", description="Configura un grupo exclusivo de roles otorgados por items")
+    @app_commands.describe(
+        item_1="Primer item con rol",
+        item_2="Segundo item con rol",
+        item_3="Tercer item con rol. Opcional.",
+        item_4="Cuarto item con rol. Opcional.",
+        item_5="Quinto item con rol. Opcional.",
+    )
+    @is_staff()
+    async def restringir_usar(
+        self,
+        interaction: discord.Interaction,
+        item_1: str,
+        item_2: str,
+        item_3: str | None = None,
+        item_4: str | None = None,
+        item_5: str | None = None,
+    ):
+        selected_names = [
+            name.strip()
+            for name in (item_1, item_2, item_3, item_4, item_5)
+            if name
+        ]
+        if len({name.lower() for name in selected_names}) != len(selected_names):
+            return await interaction.response.send_message(
+                "❌ No puedes seleccionar el mismo item más de una vez.", ephemeral=True
+            )
+
+        items = []
+        for name in selected_names:
+            item = await get_item_by_name(name)
+            if not item:
+                return await interaction.response.send_message(
+                    f"❌ No se encontró el item **{name}**.", ephemeral=True
+                )
+            if not item.get("rol_id"):
+                return await interaction.response.send_message(
+                    f"❌ **{item['nombre']}** no otorga ningún rol.", ephemeral=True
+                )
+            role = interaction.guild.get_role(int(item["rol_id"]))
+            if role is None:
+                return await interaction.response.send_message(
+                    f"❌ El rol configurado para **{item['nombre']}** ya no existe.", ephemeral=True
+                )
+            items.append((item, role))
+
+        role_ids = [role.id for _, role in items]
+        if len(set(role_ids)) != len(role_ids):
+            return await interaction.response.send_message(
+                "❌ Los items seleccionados deben otorgar roles diferentes.", ephemeral=True
+            )
+
+        await interaction.response.defer(ephemeral=True)
+        await set_item_role_restrictions_db(role_ids)
+        roles = ", ".join(role.mention for _, role in items)
+        await interaction.followup.send(
+            f"✅ Grupo exclusivo configurado con: {roles}.", ephemeral=True
+        )
+
+    @app_commands.command(name="eliminar_restriccion", description="Quita un item del grupo exclusivo de roles")
+    @app_commands.describe(item="Item cuyo rol se eliminará de la restricción")
+    @is_staff()
+    async def eliminar_restriccion(self, interaction: discord.Interaction, item: str):
+        found = await get_item_by_name(item.strip())
+        if not found:
+            return await interaction.response.send_message(
+                f"❌ No se encontró el item **{item}**.", ephemeral=True
+            )
+        if not found.get("rol_id") or int(found["rol_id"]) not in cache.get_restricted_item_role_ids():
+            return await interaction.response.send_message(
+                f"❌ **{found['nombre']}** no pertenece al grupo exclusivo.", ephemeral=True
+            )
+
+        await remove_item_role_restriction_db(int(found["rol_id"]))
+        await interaction.response.send_message(
+            f"✅ La restricción de **{found['nombre']}** fue eliminada.", ephemeral=True
+        )
+
+    @restringir_usar.autocomplete("item_1")
+    @restringir_usar.autocomplete("item_2")
+    @restringir_usar.autocomplete("item_3")
+    @restringir_usar.autocomplete("item_4")
+    @restringir_usar.autocomplete("item_5")
+    @eliminar_restriccion.autocomplete("item")
+    async def restriccion_item_autocomplete(self, interaction: discord.Interaction, current: str):
+        return [
+            app_commands.Choice(name=item["nombre"], value=item["nombre"])
+            for item in cache.get_items_cache()
+            if current.lower() in item["nombre"].lower()
+        ][:25]
+
+    @app_commands.command(name="collect_limpiar_huerfanos", description="Elimina collects de roles que ya no existen")
+    @is_staff()
+    async def collect_limpiar_huerfanos(self, interaction: discord.Interaction):
+        existing_role_ids = {role.id for role in interaction.guild.roles}
+        orphan_count = sum(
+            role_id not in existing_role_ids
+            for role_id in cache.get_collect_config()
+        )
+        if orphan_count == 0:
+            return await interaction.response.send_message(
+                "ℹ️ No hay configuraciones collect de roles inexistentes.", ephemeral=True
+            )
+        await interaction.response.send_modal(CleanOrphanCollectModal(interaction.user.id))
+
+    @app_commands.command(name="work_edit", description="Edita configuración de !work")
+    @app_commands.describe(minimo="Mínimo de coins", maximo="Máximo de coins", cooldown="Cooldown: ej 4h o 30m")
+    @is_staff()
+    async def work_edit(self, interaction, minimo: int, maximo: int, cooldown: str):
+        try:
+            seconds = self.parse_cooldown(cooldown)
+        except ValueError:
+            return await interaction.response.send_message(
+                "❌ Formato inválido. Usa ejemplos como: 6h o 30m", ephemeral=True
+            )
+        game_config["work"]["min"] = minimo
+        game_config["work"]["max"] = maximo
+        game_config["work"]["cooldown"] = seconds
+        await save_game_config()
+        await interaction.response.send_message(
+            f"✅ Work actualizado:\n• Min: {minimo}\n• Max: {maximo}\n• Cooldown: {cooldown}",
+            ephemeral=False
+        )
+
+    @app_commands.command(name="crime_edit", description="Edita configuración de !crime")
+    @app_commands.describe(
+        minimo="Min coins",
+        maximo="Max coins",
+        cooldown="CD: ej 8h o 30m",
+        ganar_prob="Prob. éxito en % (ej: 100 o 70).",
+        perder_prob="Prob. fallo en % (ej: 0 o 30)."
+    )
+    @is_staff()
+    async def crime_edit(self, interaction, minimo: int, maximo: int, cooldown: str,
+                         ganar_prob: float = None, perder_prob: float = None):
+        try:
+            seconds = self.parse_cooldown(cooldown)
+        except ValueError:
+            return await interaction.response.send_message(
+                "❌ Formato inválido. Usa ejemplos como: 6h o 30m", ephemeral=True
+            )
+
+        def parse_cooldown(value):
+            """Parsea formato 45m o 2h a segundos"""
+            match = re.match(r'^(\d+)([mh])$', value.lower())
+            if not match:
+                raise ValueError("Formato inválido. Usa: 45m o 2h")
+            amount, unit = int(match.group(1)), match.group(2)
+            if unit == 'm':
+                return amount * 60
+            else:
+                return amount * 3600
+
+        def parse_prob(value):
+            if value is None:
+                return None
+            if value > 1:
+                if value > 100:
+                    raise ValueError
+                value = value / 100
+            if value < 0 or value > 1:
+                raise ValueError
+            return value
+
+        try:
+            ganar = parse_prob(ganar_prob)
+            perder = parse_prob(perder_prob)
+        except ValueError:
+            return await interaction.response.send_message(
+                "❌ Probabilidades inválidas. Usa % como 70 o fracción 0.7.", ephemeral=True
+            )
+
+        if ganar is None and perder is None:
+            ganar = game_config["crime"]["ganar_prob"]
+            perder = game_config["crime"]["perder_prob"]
+        elif ganar is None:
+            ganar = 1 - perder
+        elif perder is None:
+            perder = 1 - ganar
+
+        if abs((ganar + perder) - 1) > 0.01:
+            return await interaction.response.send_message(
+                "❌ Las probabilidades deben sumar 100%.", ephemeral=True
+            )
+
+        game_config["crime"]["min"] = minimo
+        game_config["crime"]["max"] = maximo
+        game_config["crime"]["cooldown"] = seconds
+        game_config["crime"]["ganar_prob"] = ganar
+        game_config["crime"]["perder_prob"] = perder
+        await save_game_config()
+        await interaction.response.send_message(
+            f"✅ Crime actualizado:\n• Min: {minimo}\n• Max: {maximo}\n• CD: {cooldown}\n• Éxito: {int(ganar*100)}%\n• Fallo: {int(perder*100)}%",
+            ephemeral=False
+        )
+
+    @app_commands.command(name="dados_edit", description="Edita configuración del sistema de dados")
+    @app_commands.describe(
+        cooldown="Cooldown (ej: 45m, 2h)",
+        max_apuesta="Apuesta máxima permitida",
+        prob_exito="Probabilidad de éxito en % (ej: 50 o 0.5)",
+        prob_fallo="Probabilidad de fallo en % (ej: 50 o 0.5)"
+    )
+    @is_staff()
+    async def dados_edit(self, interaction, cooldown: str, max_apuesta: int,
+                         prob_exito: float = None, prob_fallo: float = None):
+        def parse_cooldown(value):
+            """Parsea formato 45m o 2h a segundos"""
+            match = re.match(r'^(\d+)([mh])$', value.lower())
+            if not match:
+                raise ValueError("Formato inválido. Usa: 45m o 2h")
+            amount, unit = int(match.group(1)), match.group(2)
+            if unit == 'm':
+                return amount * 60
+            else:
+                return amount * 3600
+
+        def parse_prob(value):
+            if value is None:
+                return None
+            if value > 1:
+                if value > 100:
+                    raise ValueError
+                value = value / 100
+            if value < 0 or value > 1:
+                raise ValueError
+            return value
+
+        try:
+            cooldown_seconds = parse_cooldown(cooldown)
+            exito = parse_prob(prob_exito)
+            fallo = parse_prob(prob_fallo)
+        except ValueError as e:
+            return await interaction.response.send_message(
+                f"❌ {str(e)}", ephemeral=True
+            )
+
+        if exito is None and fallo is None:
+            exito = dados_config["exito_prob"]
+            fallo = dados_config["fallo_prob"]
+        elif exito is None:
+            exito = 1 - fallo
+        elif fallo is None:
+            fallo = 1 - exito
+
+        if abs((exito + fallo) - 1) > 0.01:
+            return await interaction.response.send_message(
+                "❌ Las probabilidades deben sumar 100%.", ephemeral=True
+            )
+
+        if cooldown_seconds <= 0 or max_apuesta < 100:
+            return await interaction.response.send_message(
+                "❌ El cooldown debe ser mayor a 0 y la apuesta máxima al menos 100.", ephemeral=True
+            )
+
+        dados_config["cooldown"] = cooldown_seconds
+        dados_config["max_apuesta"] = max_apuesta
+        dados_config["exito_prob"] = exito
+        dados_config["fallo_prob"] = fallo
+        await save_dados_config()
+        await clear_game_cooldowns("dados")
+        cache.clear_game_cooldowns_cache("dados")
+
+        await interaction.response.send_message(
+            f"✅ Dados actualizados:\n• Max apuesta: {max_apuesta}\n• CD: {cooldown}\n• Éxito: {int(exito*100)}%\n• Fallo: {int(fallo*100)}%",
+            ephemeral=False
+        )
+
+    @app_commands.command(name="rob_alternar", description="Activa o desactiva el sistema de robos")
+    @is_staff()
+    async def rob_alternar(self, interaction):
+        from core.config import rob_config
+        rob_config["activa"] = not rob_config["activa"]
+        await save_rob_config()
+        estado = "✅ activado" if rob_config["activa"] else "🔧 desactivado"
+        mensaje = "Ejecuta **/rob_alternar** para activar de nuevo." if not rob_config["activa"] else "El sistema de robos ha sido reactivado."
+        await interaction.response.send_message(f"El sistema de robos ha sido **{estado}**. {mensaje}", ephemeral=False)
+
+    @app_commands.command(name="rob_edit", description="Configura el sistema de robos")
+    @app_commands.describe(
+        cooldown="CD: ej 30s, 5m, 1h",
+        exito_prob="Prob. éxito en % (ej: 50). Opcional.",
+        fallo_prob="Prob. fallo en % (ej: 50). Opcional."
+    )
+    @is_staff()
+    async def rob_edit(self, interaction, cooldown: str, exito_prob: float = None, fallo_prob: float = None):
+        from core.config import rob_config
+        try:
+            seconds = self.parse_cooldown(cooldown)
+        except ValueError:
+            return await interaction.response.send_message(
+                "❌ Formato inválido. Usa ejemplos como: 30s, 5m, 1h", ephemeral=True
+            )
+
+        if seconds <= 0:
+            return await interaction.response.send_message("❌ El cooldown debe ser mayor a 0.", ephemeral=True)
+
+        def parse_cooldown(value):
+            """Parsea formato 45m o 2h a segundos"""
+            match = re.match(r'^(\d+)([mh])$', value.lower())
+            if not match:
+                raise ValueError("Formato inválido. Usa: 45m o 2h")
+            amount, unit = int(match.group(1)), match.group(2)
+            if unit == 'm':
+                return amount * 60
+            else:
+                return amount * 3600
+
+        def parse_prob(value):
+            if value is None:
+                return None
+            if value > 1:
+                if value > 100:
+                    raise ValueError
+                value = value / 100
+            if value < 0 or value > 1:
+                raise ValueError
+            return value
+
+        try:
+            exito = parse_prob(exito_prob)
+            fallo = parse_prob(fallo_prob)
+        except ValueError:
+            return await interaction.response.send_message(
+                "❌ Probabilidades inválidas. Usa % como 50 o fracción 0.5.", ephemeral=True
+            )
+
+        if exito is None and fallo is None:
+            exito = rob_config["exito_prob"]
+            fallo = rob_config["fallo_prob"]
+        elif exito is None:
+            exito = 1 - fallo
+        elif fallo is None:
+            fallo = 1 - exito
+
+        if abs((exito + fallo) - 1) > 0.01:
+            return await interaction.response.send_message(
+                "❌ Las probabilidades deben sumar 100%.", ephemeral=True
+            )
+
+        rob_config["cooldown"] = seconds
+        rob_config["exito_prob"] = exito
+        rob_config["fallo_prob"] = fallo
+        await save_rob_config()
+        cache.clear_rob_cooldowns_cache()
+        await clear_command_cooldowns("rob")
+        await interaction.response.send_message(
+            f"✅ Rob actualizado:\n• CD: {cooldown}\n• Éxito: {int(exito*100)}%\n• Fallo: {int(fallo*100)}%",
+            ephemeral=False
+        )
+
+    @app_commands.command(name="retar_edit", description="Cambia el cooldown del comando !retar")
+    @app_commands.describe(cooldown="Cooldown en segundos")
+    @is_staff()
+    async def retar_edit(self, interaction, cooldown: int):
+        if cooldown < 0:
+            return await interaction.response.send_message("❌ El cooldown no puede ser negativo.", ephemeral=True)
+        
+        from modules.duels import _duel_cooldowns
+        _duel_cooldowns[interaction.guild.id] = cooldown
+        await set_duel_cooldown_config(interaction.guild.id, cooldown)
+        await interaction.response.send_message(f"✅ Cooldown de !retar cambiado a {cooldown} segundos.", ephemeral=True)
+
+    @app_commands.command(name="retar_alternar", description="Activa o desactiva el comando !retar")
+    @is_staff()
+    async def retar_alternar(self, interaction: discord.Interaction):
+        from modules.duels import DEFAULT_DUEL_COOLDOWN, _duel_active, _duel_cooldowns
+
+        guild_id = interaction.guild.id
+        activa = _duel_active.get(guild_id)
+        if activa is None:
+            activa = await get_duel_active_config(guild_id, True)
+
+        nueva_activa = not activa
+        cooldown = _duel_cooldowns.get(guild_id, DEFAULT_DUEL_COOLDOWN)
+        await set_duel_active_config(guild_id, nueva_activa, cooldown)
+        _duel_active[guild_id] = nueva_activa
+
+        estado = "ON" if nueva_activa else "OFF"
+        await interaction.response.send_message(
+            f"✅ Arena de batalla: **{estado}**.",
+            ephemeral=True,
+        )
+
+    @app_commands.command(name="veterano_config", description="Configurar Rol Anti-Robo")
+    @app_commands.describe(
+        protect_rol="Rol con protección anti-robo",
+        monto_penalizar="Monto a descontar del banco del atacante",
+        msj_atacante="Mensaje que verá el atacante (se añade tras '🖐️ Lo siento tanto @atacante')"
+    )
+    @is_staff()
+    async def veterano_config(
+        self,
+        interaction: discord.Interaction,
+        protect_rol: discord.Role,
+        monto_penalizar: int,
+        msj_atacante: str
+    ):
+        if monto_penalizar <= 0:
+            return await interaction.response.send_message(
+                "❌ El monto de penalización debe ser mayor a 0.", ephemeral=True
+            )
+
+        await interaction.response.defer(ephemeral=False)
+
+        from core.database import upsert_veterano_config_db
+        await upsert_veterano_config_db(protect_rol.id, monto_penalizar, msj_atacante.strip())
+
+        await interaction.followup.send(
+            f"🛡️ Protección Anti-Robo configurada:\n"
+            f"• Rol protegido: {protect_rol.mention}\n"
+            f"• Penalización al atacante: **{monto_penalizar}** {COIN} (banco)\n"
+            f"• Mensaje: *🖐️ Lo siento tanto {interaction.user.mention} {msj_atacante.strip()}*",
+            ephemeral=False
+        )
+
+    @app_commands.command(name="veterano_eliminar", description="Elimina la protección Anti-Robo de un rol")
+    @app_commands.describe(protect_rol="Rol a desproteger")
+    @is_staff()
+    async def veterano_eliminar(
+        self,
+        interaction: discord.Interaction,
+        protect_rol: discord.Role
+    ):
+        from core import cache as _cache
+        cfg = _cache.get_veterano_config()
+        if protect_rol.id not in cfg:
+            return await interaction.response.send_message(
+                f"❌ {protect_rol.mention} no tiene protección Anti-Robo configurada.", ephemeral=True
+            )
+
+        await interaction.response.defer(ephemeral=False)
+        from core.database import delete_veterano_config_db
+        await delete_veterano_config_db(protect_rol.id)
+        await interaction.followup.send(
+            f"✅ Protección Anti-Robo de {protect_rol.mention} eliminada.", ephemeral=False
+        )
+
+    @app_commands.command(name="saboteador_config", description="Configura un Rol Saboteador Anti-Veterano")
+    @app_commands.describe(saboteador_rol="Rol que puede romper protecciones Veterano")
+    @is_staff()
+    async def saboteador_config(
+        self,
+        interaction: discord.Interaction,
+        saboteador_rol: discord.Role,
+    ):
+        if saboteador_rol.id in cache.get_saboteador_role_ids():
+            return await interaction.response.send_message(
+                f"❌ {saboteador_rol.mention} ya está configurado como Saboteador.",
+                ephemeral=True,
+            )
+
+        await interaction.response.defer(ephemeral=False)
+        from core.database import add_saboteador_role_db
+        await add_saboteador_role_db(saboteador_rol.id)
+        await interaction.followup.send(
+            f"😈 Rol Saboteador configurado: {saboteador_rol.mention}\n"
+            "• Puede romper la protección Veterano al usar `!rob`.",
+            ephemeral=False,
+        )
+
+    @app_commands.command(name="saboteador_eliminar", description="Elimina un Rol Saboteador")
+    @app_commands.describe(saboteador_rol="Rol al que se le quitará la capacidad Saboteador")
+    @is_staff()
+    async def saboteador_eliminar(
+        self,
+        interaction: discord.Interaction,
+        saboteador_rol: discord.Role,
+    ):
+        if saboteador_rol.id not in cache.get_saboteador_role_ids():
+            return await interaction.response.send_message(
+                f"❌ {saboteador_rol.mention} no está configurado como Saboteador.",
+                ephemeral=True,
+            )
+
+        await interaction.response.defer(ephemeral=False)
+        from core.database import delete_saboteador_role_db
+        await delete_saboteador_role_db(saboteador_rol.id)
+        await interaction.followup.send(
+            f"✅ Rol Saboteador eliminado: {saboteador_rol.mention}.",
+            ephemeral=False,
+        )
+
+
+    @app_commands.command(name="despidos", description="Activa o desactiva el sistema de despidos por inactividad (24h sin trabajar)")
+    @app_commands.describe(estado="Elige el estado del sistema de despidos")
+    @app_commands.choices(estado=[
+        app_commands.Choice(name="🟢 ON  — Activar despidos por inactividad", value="on"),
+        app_commands.Choice(name="🔴 OFF — Desactivar despidos por inactividad", value="off"),
+    ])
+    @is_staff()
+    async def despidos(self, interaction: discord.Interaction, estado: app_commands.Choice[str]):
+        from modules.Empleos import _despidos_config
+        await interaction.response.defer(ephemeral=False)
+        nuevo_estado = estado.value == "on"
+        await set_system_toggle("despidos", nuevo_estado)
+        _despidos_config["activo"] = nuevo_estado
+        if _despidos_config["activo"]:
+            await interaction.followup.send(
+                "🟢 Sistema de despidos **activado**.\n"
+                "Los usuarios serán despedidos si ejecutan `!trabajar` con más de 24h de inactividad.",
+                ephemeral=False
+            )
+        else:
+            await interaction.followup.send(
+                "🔴 Sistema de despidos **desactivado**.\n"
+                "Los usuarios pueden trabajar sin riesgo de ser despedidos por inactividad.",
+                ephemeral=False
+            )
+
+async def setup(bot):
+    await bot.add_cog(Staff(bot))
