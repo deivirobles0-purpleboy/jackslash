@@ -500,14 +500,14 @@ def _build_cooldowns_embed(guild_id: int) -> discord.Embed:
         url="https://pub-a09b3609b6b34dfab5c7aa7742cd1a8a.r2.dev/Purple%20jack%20Harcode/cdPJ.png"
     )
     embed.description = (
-        f"**!work**     — Cada {work_cd}\n"
-        f"**!crime**    — Cada {crime_cd}\n"
-        f"**!ruleta**   — Cada {ruleta_cd}\n"
-        f"**!rob**      — Cada {rob_cd}\n"
-        f"**!dados**    — Cada {dados_cd}\n"
-        f"**!memo**     — Cada {memo_cd}\n"
-        f"**!bj**       — Cada {blackjack_cd}\n"
-        f"**!retar**    — Cada {retar_cd}"
+        f"**/work** — Cada {work_cd}\n"
+        f"**/crime** — Cada {crime_cd}\n"
+        f"**Ruleta (/jugar)** — Cada {ruleta_cd}\n"
+        f"**/rob** — Cada {rob_cd}\n"
+        f"**Dados (/jugar)** — Cada {dados_cd}\n"
+        f"**Memo (/jugar)** — Cada {memo_cd}\n"
+        f"**Blackjack (/jugar)** — Cada {blackjack_cd}\n"
+        f"**/retar** — Cada {retar_cd}"
     )
     return embed
 
@@ -539,7 +539,7 @@ class CooldownsPanelView(ui.View):
             return
 
         expired_embed = discord.Embed(
-            title="*Consulta **!cd** para ver la info de cooldowns y collects.*",
+            title="Consulta **/consultar** → **CD** para ver cooldowns y collects.",
             color=discord.Color.purple(),
         )
         try:

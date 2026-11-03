@@ -14,6 +14,7 @@ from core.database import (
     refund_wager,
 )
 from core.config import COIN, memo_config
+from core.game_reminders import send_game_reminder_prompt
 
 logger = logging.getLogger("purplejack.memo")
 
@@ -118,6 +119,7 @@ class MemoView(discord.ui.View):
         expira_en = time.time() + memo_config["cooldown"]
         await set_command_cooldown("user", self.author.id, "memo", expira_en)
         _memo_cooldowns[self.author.id] = expira_en
+        return expira_en
 
     def _make_callback(self, idx: int):
         async def callback(interaction: discord.Interaction):
@@ -179,8 +181,9 @@ class MemoView(discord.ui.View):
                         if not settlement.get("ok"):
                             raise RuntimeError(f"No se pudo liquidar Memo: {settlement.get('reason')}")
                         self._wager_finalizada = True
+                        expires_at = None
                         try:
-                            await self._start_cooldown()
+                            expires_at = await self._start_cooldown()
                         except Exception:
                             logger.exception("Memo %s terminó sin poder guardar el cooldown.", self.wager_id)
                         embed = self._build_embed(
@@ -195,6 +198,10 @@ class MemoView(discord.ui.View):
                         _active_memo.discard(self.author.id)
                         await self._editar_tablero(interaction, embed=embed)
                         asyncio.create_task(self._programar_eliminacion())
+                        if expires_at is not None:
+                            await send_game_reminder_prompt(
+                                interaction.channel, self.author.id, "memo", expires_at,
+                            )
                         return
 
                     self.bloqueado = False
@@ -210,8 +217,9 @@ class MemoView(discord.ui.View):
                     if not settlement.get("ok"):
                         raise RuntimeError(f"No se pudo liquidar Memo: {settlement.get('reason')}")
                     self._wager_finalizada = True
+                    expires_at = None
                     try:
-                        await self._start_cooldown()
+                        expires_at = await self._start_cooldown()
                     except Exception:
                         logger.exception("Memo %s terminó sin poder guardar el cooldown.", self.wager_id)
                     self.revelado = [True] * 16
@@ -225,6 +233,10 @@ class MemoView(discord.ui.View):
                     _active_memo.discard(self.author.id)
                     await self._editar_tablero(interaction, embed=embed)
                     asyncio.create_task(self._programar_eliminacion())
+                    if expires_at is not None:
+                        await send_game_reminder_prompt(
+                            interaction.channel, self.author.id, "memo", expires_at,
+                        )
                     return
 
                 # Las dos incorrectas quedan visibles brevemente y el lock
@@ -351,7 +363,7 @@ class Memo(commands.Cog):
         if monto is None:
             nick = ctx.author.nick or ctx.author.display_name
             return await ctx.reply(
-                f"❌ **{nick}** Formato correcto: `!memo {{monto}}`",
+                f"❌ **{nick}** Abre **/jugar apuesta** y selecciona **Memo**.",
                 mention_author=False,
             )
         if not memo_config["activa"]:
@@ -416,7 +428,7 @@ class Memo(commands.Cog):
         if isinstance(error, commands.BadArgument):
             await ctx.send(
                 f"❌ {ctx.author.mention} El monto debe ser un número entero. "
-                f"Formato: `!memo {{monto}}`"
+                "Abre **/jugar apuesta** y selecciona **Memo**."
             )
         else:
             raise error

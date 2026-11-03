@@ -15,6 +15,7 @@ from core.database import (
 )
 from core.config import game_config, ruleta_config, COIN   # ← COIN desde config (no duplicar)
 from core import cache
+from core.game_reminders import send_game_reminder_prompt
 
 ROULETTE_THUMBNAIL_URL = "https://pub-a09b3609b6b34dfab5c7aa7742cd1a8a.r2.dev/Purple%20jack%20Harcode/RuletaPJ.gif"
 ROULETTE_WIN_THUMBNAIL_URL = "https://pub-a09b3609b6b34dfab5c7aa7742cd1a8a.r2.dev/Purple%20jack%20Harcode/RuletaWinPJ.png"
@@ -50,8 +51,7 @@ class Roulette(commands.Cog):
         if apuesta is None or espacio is None:
             nick = ctx.author.nick or ctx.author.display_name
             return await ctx.reply(
-                f"❌ **{nick}** Formato correcto: "
-                f"`!ruleta {{apuesta}} {{opción}}`\n"
+                f"❌ **{nick}** Abre **/jugar apuesta** y selecciona **Ruleta**.\n"
                 f"Opciones: `black`, `red`, `par`, `impar`, "
                 f"o un número del `0` al `36`",
                 mention_author=False,
@@ -216,6 +216,7 @@ class Roulette(commands.Cog):
             await set_game_cooldown(user_id, "ruleta", expira_en)
             cache.set_game_cooldown_cache(user_id, "ruleta", expira_en)
             await ctx.send(embed=embed_resultado)
+            await send_game_reminder_prompt(ctx.channel, user_id, "ruleta", expira_en)
         except Exception:
             await refund_wager(wager["id"])
             raise

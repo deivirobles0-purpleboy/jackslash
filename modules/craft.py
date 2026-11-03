@@ -86,7 +86,7 @@ class CraftConfirmButton(discord.ui.Button):
             view.pending_item = None
             if result["ok"]:
                 view.balance = result["balance"]
-                view.notice = f"✅ Canjeaste **{result['item_name']}**. Ya aparece en **!inv**."
+                view.notice = f"✅ Canjeaste **{result['item_name']}**. Ya aparece en **/consultar** → **Inventario**."
             else:
                 reasons = {
                     "not_found": "❌ Este artículo ya no está disponible.",
@@ -111,7 +111,7 @@ class CraftConfirmButton(discord.ui.Button):
                     )
                     await view.balance_message.edit(embed=embed)
                 except (IndexError, discord.HTTPException):
-                    logger.warning("Canje procesado, pero no se pudo actualizar !bal de %s", interaction.user.id)
+                    logger.warning("Canje procesado, pero no se pudo actualizar el balance de %s", interaction.user.id)
         finally:
             view.processing = False
 
@@ -157,7 +157,7 @@ class CraftLayout(discord.ui.LayoutView):
             return False
         if time.monotonic() >= self.expires_at:
             await interaction.response.send_message(
-                "⌛ El panel de crafteo caducó. Abre **!bal** nuevamente.",
+                "⌛ El panel de crafteo caducó. Abre **/consultar** → **Balance** nuevamente.",
                 ephemeral=True,
             )
             return False

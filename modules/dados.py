@@ -13,6 +13,7 @@ from core.database import (
 from core.config import COIN, dados_config
 from core import cache
 from core.cd_boost import resolve_cd_boost, send_cd_boost_notice
+from core.game_reminders import send_game_reminder_prompt
 
 DICE_GIF = "https://pub-a09b3609b6b34dfab5c7aa7742cd1a8a.r2.dev/Purple%20jack%20Harcode/DadosPJ.gif"
 _ACTIVE_DADOS: set[int] = set()
@@ -207,6 +208,9 @@ class DadosRollView(discord.ui.View):
                     asyncio.create_task(self.message.delete(delay=80))
             except Exception:
                 pass
+            await send_game_reminder_prompt(
+                interaction.channel, self.author_id, "dados", expira_en,
+            )
 
 
     async def on_error(self, interaction, error, item):
@@ -245,7 +249,7 @@ class Dados(commands.Cog):
         if monto is None:
             nick = ctx.author.nick or ctx.author.display_name
             return await ctx.reply(
-                f"❌ {nick} Usa: `!dados {{monto}}`.",
+                f"❌ {nick} Abre **/jugar apuesta** y selecciona **Dados**.",
                 mention_author=False,
             )
 

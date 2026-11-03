@@ -42,9 +42,7 @@ def _get_economy_lock(user_id):
 
 async def init_db():
     global pool
-    logger.info("[DB:CONNECT] Abriendo pool PostgreSQL...")
     pool = await asyncpg.create_pool(DATABASE_URL)
-    logger.info("[DB:SCHEMA] Pool conectado; verificando tablas e índices...")
     async with pool.acquire() as conn:
         await conn.execute("""
         CREATE TABLE IF NOT EXISTS users (

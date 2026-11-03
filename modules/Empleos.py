@@ -196,7 +196,7 @@ async def _caducar_tablero(view: ui.View):
     try:
         embed = view.build_embed()
         embed.color = discord.Color.dark_grey()
-        embed.set_footer(text="Jornada caducada. Consulta !trabajar para iniciar otra.")
+        embed.set_footer(text="Jornada caducada. Abre /trabajar para iniciar otra.")
         await view.message.edit(embed=embed, view=view)
     except (discord.HTTPException, discord.NotFound):
         pass
@@ -270,7 +270,7 @@ async def _cerrar_tablero_con_error(
             if cancelada
             else (
                 "No fue posible liquidar ni cerrar la jornada en Aiven. "
-                "Espera unos minutos antes de consultar **!trabajar** nuevamente."
+                "Espera unos minutos antes de abrir **/trabajar** nuevamente."
             )
         )
     )
@@ -334,7 +334,7 @@ async def _cerrar_tablero_por_inactividad(view: ui.View, empleo: str):
     else:
         descripcion = (
             "No fue posible cerrar la jornada en este momento. "
-            "El sistema la revisará automáticamente; intenta usar **!trabajar** más tarde."
+            "El sistema la revisará automáticamente; abre **/trabajar** más tarde."
         )
         color = discord.Color.red()
 
@@ -1496,7 +1496,7 @@ class ConfirmarEmpleoView(ui.View):
 
         mensaje = (
             f"🎉 {interaction.user.mention} ahora eres **{info['nombre'] if es_maestria else self.empleo.title()}**. "
-            "Usa `!trabajar` para iniciar tu jornada de 3 horas."
+            "Usa el panel **/trabajar** para iniciar tu jornada de 3 horas."
         )
         if xp_consumida:
             mensaje += f"\n📊 Se consumieron **{xp_consumida}** XP Laboral."
@@ -1541,7 +1541,7 @@ class OficinaBaseView(ui.View):
             return False
         if time.time() >= self.expires_at:
             await interaction.response.send_message(
-                "Panel Vencido consulta nuevamente. **!oficina**",
+                "Panel vencido. Abre **/trabajar** → **Oficina** nuevamente.",
                 ephemeral=True,
             )
             return False
@@ -1641,7 +1641,7 @@ class MaestriaModal(ui.Modal, title="Adquirir Maestrías"):
             return await interaction.response.send_message("❌ Este panel no es tuyo.", ephemeral=True)
         if time.time() >= self.expires_at:
             return await interaction.response.send_message(
-                "Panel Vencido consulta nuevamente. **!oficina**",
+                "Panel vencido. Abre **/trabajar** → **Oficina** nuevamente.",
                 ephemeral=True,
             )
 
@@ -1732,7 +1732,7 @@ class EmpleosMaestriaSelect(ui.Select):
             return await interaction.response.send_message("❌ Este panel no es tuyo.", ephemeral=True)
         if time.time() >= self.expires_at:
             return await interaction.response.send_message(
-                "Panel Vencido consulta nuevamente. **!oficina**",
+                "Panel vencido. Abre **/trabajar** → **Oficina** nuevamente.",
                 ephemeral=True,
             )
 

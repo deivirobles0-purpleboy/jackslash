@@ -24,16 +24,16 @@ class PanelTests(unittest.IsolatedAsyncioTestCase):
         game.build()
         self.assertEqual(game.to_components()[0]["type"], 17)
 
-    async def test_cooldown_disables_game_and_enables_bell(self):
+    async def test_cooldown_disables_game_without_panel_bells(self):
         game = GamePanel(1, 100, None)
-        with patch("modules.player_panels._cooldown", new=AsyncMock(return_value=9999999999)), \
-             patch("modules.player_panels.reminder_enabled", new=AsyncMock(return_value=True)):
+        with patch("modules.player_panels._cooldown", new=AsyncMock(return_value=9999999999)):
             await game.refresh()
         container = game.children[0]
         rows = [child for child in container.children if child.__class__.__name__ == "ActionRow"]
-        self.assertEqual(len(rows), 2)
-        self.assertTrue(all(button.disabled for button in rows[0].children))
-        self.assertTrue(all(not button.disabled for button in rows[1].children))
+        self.assertEqual(len(rows), 4)
+        self.assertTrue(all(len(row.children) == 1 for row in rows))
+        self.assertTrue(all(row.children[0].disabled for row in rows))
+        self.assertFalse(any("🔔" in row.children[0].label for row in rows))
 
     def test_number_modal_range(self):
         modal = RouletteNumber(GamePanel(1, 100, None))
@@ -48,6 +48,57 @@ class PanelTests(unittest.IsolatedAsyncioTestCase):
             [button.mode for row in rows for button in row.children],
             ["trabajar", "aplicar", "renunciar", "oficina", "empleos", "exp"],
         )
+        self.assertTrue(all(len(row.children) == 1 for row in rows))
+
+    def test_consult_panel_stacks_its_buttons(self):
+        panel = SimplePanel(1, "consultar")
+        rows = [child for child in panel.children[0].children
+                if child.__class__.__name__ == "ActionRow"]
+        self.assertEqual(len(rows), 6)
+        self.assertTrue(all(len(row.children) == 1 for row in rows))
+        self.assertIn("Panel de consultas Purplejack", str(panel.to_components()))
+
+    def test_game_panel_has_no_redundant_start_notice(self):
+        root = Path(__file__).resolve().parents[1]
+        source = (root / "modules" / "player_panels.py").read_text(encoding="utf-8")
+        self.assertNotIn("Iniciando **", source)
+
+    def test_reminder_prompt_is_v2_with_one_explicit_game(self):
+        from core.game_reminders import ReminderPrompt
+        prompt = ReminderPrompt(42, "dados", 9999999999)
+        self.assertEqual(prompt.to_components()[0]["type"], 17)
+        self.assertIn("Dados", str(prompt.to_components()))
+        self.assertEqual(prompt.timeout, 15)
+
+    async def test_reminder_confirmation_persists_and_deletes_after_three_seconds(self):
+        from core.game_reminders import ReminderPrompt
+        prompt = ReminderPrompt(42, "dados", 9999999999)
+        button = prompt.children[0].children[1].children[0]
+        message = SimpleNamespace(edit=AsyncMock(), delete=AsyncMock())
+        interaction = SimpleNamespace(
+            user=SimpleNamespace(id=42),
+            response=SimpleNamespace(defer=AsyncMock()),
+            followup=SimpleNamespace(send=AsyncMock()),
+            message=message,
+        )
+        with patch("core.game_reminders.database.get_game_cooldown",
+                   new=AsyncMock(return_value=9999999999)), \
+             patch("core.game_reminders.set_reminder", new=AsyncMock()) as save, \
+             patch("core.game_reminders.asyncio.sleep", new=AsyncMock()) as sleep:
+            await button.callback(interaction)
+        save.assert_awaited_once_with(42, "dados", 9999999999)
+        sleep.assert_awaited_once_with(3)
+        message.edit.assert_awaited_once()
+        message.delete.assert_awaited_once()
+
+    async def test_reminder_prompt_expires_after_fifteen_seconds(self):
+        from core.game_reminders import ReminderPrompt, _delete_prompt_after
+        prompt = ReminderPrompt(42, "memo", 9999999999)
+        prompt.message = SimpleNamespace(delete=AsyncMock())
+        with patch("core.game_reminders.asyncio.sleep", new=AsyncMock()) as sleep:
+            await _delete_prompt_after(prompt, 15)
+        sleep.assert_awaited_once_with(15)
+        prompt.message.delete.assert_awaited_once()
 
     async def test_slash_context_uses_first_public_followup(self):
         interaction = SimpleNamespace(
@@ -250,6 +301,7 @@ class PanelTests(unittest.IsolatedAsyncioTestCase):
             author=SimpleNamespace(id=1, nick="Tester", display_name="Tester",
                                    mention="<@1>"),
             message=SimpleNamespace(id=123),
+            channel=SimpleNamespace(),
             send=send,
         )
         with patch("modules.roulette.cache.get_game_cooldown_cache", return_value=0), \
@@ -260,9 +312,11 @@ class PanelTests(unittest.IsolatedAsyncioTestCase):
              patch("modules.roulette.set_game_cooldown", new=cooldown), \
              patch("modules.roulette.cache.set_game_cooldown_cache"), \
              patch("modules.roulette.asyncio.sleep", new=AsyncMock()), \
-             patch("modules.roulette.random.choice", return_value="1"):
+             patch("modules.roulette.random.choice", return_value="1"), \
+             patch("modules.roulette.send_game_reminder_prompt",
+                   new=AsyncMock(side_effect=lambda *args: events.append("prompt"))):
             await Roulette.ruleta.callback(Roulette(None), context, 100, "red")
-        self.assertEqual(events, ["message", "settle", "cooldown", "message"])
+        self.assertEqual(events, ["message", "settle", "cooldown", "message", "prompt"])
 
 
 if __name__ == "__main__":

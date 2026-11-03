@@ -589,8 +589,7 @@ class Duels(commands.Cog):
 
         if usuario is None or monto is None:
             return await ctx.reply(
-                f"{ctx.author.mention} Formatos válidos: `!retar @usuario monto`, "
-                "`!retar ID monto` o responde a su mensaje con `!retar monto`."
+                f"{ctx.author.mention} Usa **/retar usuario apuesta**."
             )
 
         if ctx.author.id == usuario.id:
@@ -645,8 +644,7 @@ class Duels(commands.Cog):
             )
         if isinstance(error, (commands.MissingRequiredArgument, commands.TooManyArguments)):
             await ctx.send(
-                f"{ctx.author.mention} Formatos válidos: `!retar @usuario monto`, "
-                "`!retar ID monto` o responde a su mensaje con `!retar monto`."
+                f"{ctx.author.mention} Usa **/retar usuario apuesta**."
             )
         elif isinstance(error, commands.CommandOnCooldown):
             retry_after = error.retry_after

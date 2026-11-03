@@ -7,6 +7,7 @@ import discord
 from discord.ext import commands
 
 from core import cache
+from core.game_reminders import send_game_reminder_prompt
 from core.config import COIN, blackjack_config
 from core.database import (
     refund_wager,
@@ -225,16 +226,18 @@ class BlackjackView(discord.ui.View):
         if last_error:
             raise last_error
 
-    async def _apply_cooldown(self) -> None:
+    async def _apply_cooldown(self) -> float | None:
         expires_at = time.time() + self.game.cooldown
         try:
             await set_game_cooldown(self.game.user_id, "bj", expires_at)
             cache.set_game_cooldown_cache(self.game.user_id, "bj", expires_at)
+            return expires_at
         except Exception:
             logger.exception(
                 "La partida BJ %s se liquidó, pero no se pudo guardar el cooldown.",
                 self.game.wager_id,
             )
+            return None
 
     def _result_description(self, outcome: str, net: int, detail: str) -> tuple[str, discord.Color]:
         if outcome in {"win", "blackjack"}:
@@ -278,7 +281,7 @@ class BlackjackView(discord.ui.View):
             self.disable_all()
             self.stop()
             _ACTIVE_BLACKJACK.discard(self.game.user_id)
-            await self._apply_cooldown()
+            expires_at = await self._apply_cooldown()
 
             description, color = self._result_description(outcome, net, detail)
             embed = self.build_embed(
@@ -295,6 +298,14 @@ class BlackjackView(discord.ui.View):
                 )
             if self.game.message is not None:
                 asyncio.create_task(self.game.message.delete(delay=120))
+            if expires_at is not None:
+                channel = (
+                    getattr(self.game.message, "channel", None) if self.game.message is not None
+                    else interaction.channel if interaction is not None else None
+                )
+                await send_game_reminder_prompt(
+                    channel, self.game.user_id, "bj", expires_at,
+                )
         except Exception as error:
             # Si la liquidación alcanzó a confirmarse, refund_wager no podrá
             # tocarla. Si quedó pendiente, intenta devolverla inmediatamente.
@@ -498,7 +509,7 @@ class Blackjack(commands.Cog):
             )
         if apuesta is None:
             return await ctx.send(
-                f"❌ {ctx.author.mention} Formato correcto: `!bj {{apuesta}}`."
+                f"❌ {ctx.author.mention} Abre **/jugar apuesta** y selecciona **Blackjack**."
             )
         if apuesta < 100:
             return await ctx.message.reply(
@@ -577,7 +588,7 @@ class Blackjack(commands.Cog):
     async def blackjack_error(self, ctx, error):
         if isinstance(error, (commands.BadArgument, commands.MissingRequiredArgument)):
             await ctx.send(
-                f"❌ {ctx.author.mention} Formato correcto: `!bj {{apuesta}}`."
+                f"❌ {ctx.author.mention} Abre **/jugar apuesta** y selecciona **Blackjack**."
             )
             return
         raise error

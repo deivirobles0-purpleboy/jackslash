@@ -784,7 +784,7 @@ class Staff(commands.Cog):
         await interaction.response.defer(ephemeral=True)
         await activar_evento_db()
         await interaction.followup.send(
-            "✅ Evento activado. Desde ahora se registran los cambios de balance para `!evento`.",
+            "✅ Evento activado. Desde ahora se registran los cambios de balance para el ranking del evento.",
             ephemeral=True,
         )
 
@@ -1429,15 +1429,15 @@ class Staff(commands.Cog):
     @app_commands.command(name="add_item", description="Agrega un nuevo item a la tienda")
     @app_commands.describe(
         nombre="Nombre del item",
-        desc="Descripción corta (visible en !tienda)",
+        desc="Descripción corta (visible en /tienda)",
         precio="Precio en PurpleCoins",
         stock="Stock total (-1 = ilimitado)",
         icono="Emoji del servidor o unicode. Ej: <:nombre:123456> o 🌟",
-        desc_larga="Descripción larga visible en !info. Opcional.",
+        desc_larga="Descripción larga visible en /consultar → Info. Opcional.",
         rol="Rol que se otorga al usar el item. Opcional.",
         duracion_rol="Duración del rol: ej 30m, 12h, 7d. Vacío = permanente. Opcional.",
         cantid_por_user="Límite de compras por usuario. Vacío = ilimitado. Opcional.",
-        mensaje_uso="Mensaje al usar el item en !inv. Vacío = mensaje por defecto. Opcional.",
+        mensaje_uso="Mensaje al usar el item en /consultar → Inventario. Vacío = mensaje por defecto.",
         limite_uso="Máximo de usos por día por usuario. Ej: 1. Vacío = sin límite. Opcional.",
         cd_boost="Reduce 50% los cooldowns compatibles durante 180 minutos.",
         caduca="Vencimiento tras comprar: solo días, ej. 5d. Vacío = no caduca."
@@ -2056,7 +2056,7 @@ class Staff(commands.Cog):
             )
         await interaction.response.send_modal(CleanOrphanCollectModal(interaction.user.id))
 
-    @app_commands.command(name="work_edit", description="Edita configuración de !work")
+    @app_commands.command(name="work_edit", description="Edita configuración de /work")
     @app_commands.describe(minimo="Mínimo de coins", maximo="Máximo de coins", cooldown="Cooldown: ej 4h o 30m")
     @is_staff()
     async def work_edit(self, interaction, minimo: int, maximo: int, cooldown: str):
@@ -2075,7 +2075,7 @@ class Staff(commands.Cog):
             ephemeral=False
         )
 
-    @app_commands.command(name="crime_edit", description="Edita configuración de !crime")
+    @app_commands.command(name="crime_edit", description="Edita configuración de /crime")
     @app_commands.describe(
         minimo="Min coins",
         maximo="Max coins",
@@ -2302,7 +2302,7 @@ class Staff(commands.Cog):
             ephemeral=False
         )
 
-    @app_commands.command(name="retar_edit", description="Cambia el cooldown del comando !retar")
+    @app_commands.command(name="retar_edit", description="Cambia el cooldown del comando /retar")
     @app_commands.describe(cooldown="Cooldown en segundos")
     @is_staff()
     async def retar_edit(self, interaction, cooldown: int):
@@ -2312,9 +2312,9 @@ class Staff(commands.Cog):
         from modules.duels import _duel_cooldowns
         _duel_cooldowns[interaction.guild.id] = cooldown
         await set_duel_cooldown_config(interaction.guild.id, cooldown)
-        await interaction.response.send_message(f"✅ Cooldown de !retar cambiado a {cooldown} segundos.", ephemeral=True)
+        await interaction.response.send_message(f"✅ Cooldown de /retar cambiado a {cooldown} segundos.", ephemeral=True)
 
-    @app_commands.command(name="retar_alternar", description="Activa o desactiva el comando !retar")
+    @app_commands.command(name="retar_alternar", description="Activa o desactiva el comando /retar")
     @is_staff()
     async def retar_alternar(self, interaction: discord.Interaction):
         from modules.duels import DEFAULT_DUEL_COOLDOWN, _duel_active, _duel_cooldowns
@@ -2408,7 +2408,7 @@ class Staff(commands.Cog):
         await add_saboteador_role_db(saboteador_rol.id)
         await interaction.followup.send(
             f"😈 Rol Saboteador configurado: {saboteador_rol.mention}\n"
-            "• Puede romper la protección Veterano al usar `!rob`.",
+            "• Puede romper la protección Veterano al usar **/rob**.",
             ephemeral=False,
         )
 
@@ -2451,7 +2451,7 @@ class Staff(commands.Cog):
         if _despidos_config["activo"]:
             await interaction.followup.send(
                 "🟢 Sistema de despidos **activado**.\n"
-                "Los usuarios serán despedidos si ejecutan `!trabajar` con más de 24h de inactividad.",
+                "Los usuarios serán despedidos si usan el panel **/trabajar** con más de 24h de inactividad.",
                 ephemeral=False
             )
         else:

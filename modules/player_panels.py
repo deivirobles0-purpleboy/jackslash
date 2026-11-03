@@ -11,7 +11,6 @@ from discord import app_commands
 from discord.ext import commands
 
 from core.database import get_command_cooldown, get_game_cooldown
-from core.game_reminders import cancel_reminder, reminder_enabled, set_reminder
 
 logger = logging.getLogger(__name__)
 
@@ -114,31 +113,6 @@ class GameButton(discord.ui.Button):
             await view.launch(interaction, self.game)
 
 
-class BellButton(discord.ui.Button):
-    def __init__(self, game: str, expires_at: float, enabled: bool):
-        super().__init__(label="🔔" if enabled else "🔕", style=discord.ButtonStyle.secondary,
-                         disabled=expires_at <= time.time())
-        self.game = game
-
-    async def callback(self, interaction: discord.Interaction):
-        view: GamePanel = self.view
-        if not await _owned(view, interaction):
-            return
-        expiry = await _cooldown(view.owner_id, self.game)
-        if expiry <= time.time():
-            await interaction.response.send_message("Este juego ya está disponible.", ephemeral=True)
-            return
-        if await reminder_enabled(view.owner_id, self.game, expiry):
-            await cancel_reminder(view.owner_id, self.game)
-            response = "🔕 Recordatorio desactivado."
-        else:
-            await set_reminder(view.owner_id, self.game, expiry)
-            response = f"🔔 Te avisaré por mensaje privado <t:{int(expiry)}:R>."
-        await view.refresh()
-        await interaction.response.edit_message(view=view)
-        await interaction.followup.send(response, ephemeral=True)
-
-
 class GamePanel(discord.ui.LayoutView):
     def __init__(self, owner_id: int, bet: int, source: discord.Interaction):
         super().__init__(timeout=900)
@@ -149,7 +123,6 @@ class GamePanel(discord.ui.LayoutView):
         self.active: set[str] = set()
         self.active_since: dict[str, float] = {}
         self.cooldowns: dict[str, float] = {}
-        self.reminders: dict[str, bool] = {}
         self._lock = asyncio.Lock()
         self._poll_task: asyncio.Task | None = None
 
@@ -157,10 +130,6 @@ class GamePanel(discord.ui.LayoutView):
         for game in GAMES:
             expiry = await _cooldown(self.owner_id, game)
             self.cooldowns[game] = expiry
-            self.reminders[game] = (
-                expiry > time.time()
-                and await reminder_enabled(self.owner_id, game, expiry)
-            )
         self.build()
 
     def build(self):
@@ -171,18 +140,11 @@ class GamePanel(discord.ui.LayoutView):
             "Escoge un juego; su tablero se publicará en el canal."
         ))
         container.add_item(discord.ui.Separator())
-        game_row = discord.ui.ActionRow()
-        bell_row = discord.ui.ActionRow()
         for game in GAMES:
             expiry = self.cooldowns.get(game, 0)
-            game_row.add_item(GameButton(game, game in self.active or expiry > time.time()))
-            bell_row.add_item(BellButton(game, expiry, self.reminders.get(game, False)))
-        container.add_item(game_row)
-        container.add_item(discord.ui.TextDisplay(
-            "🔔 Activa una campana cuando el juego entre en cooldown. "
-            "El aviso llegará por mensaje privado."
-        ))
-        container.add_item(bell_row)
+            row = discord.ui.ActionRow()
+            row.add_item(GameButton(game, game in self.active or expiry > time.time()))
+            container.add_item(row)
         self.add_item(container)
 
     async def launch(self, interaction: discord.Interaction, game: str, option: str | None = None):
@@ -210,9 +172,6 @@ class GamePanel(discord.ui.LayoutView):
             ctx = PanelContext(interaction, private=False)
             failed = False
             try:
-                await interaction.followup.send(
-                    f"Iniciando **{GAMES[game][0]}** en este canal…", ephemeral=True,
-                )
                 command = getattr(cog, GAMES[game][2])
                 if game == "ruleta":
                     await command.callback(cog, ctx, self.bet, option)
@@ -285,7 +244,15 @@ class RouletteNumber(discord.ui.Modal, title="Número de ruleta"):
             await interaction.response.send_message("Elige un número del 0 al 36.", ephemeral=True)
             return
         await interaction.response.defer(ephemeral=True)
-        await self.panel.launch(interaction, "ruleta", str(int(self.number.value)))
+        try:
+            await self.panel.launch(interaction, "ruleta", str(int(self.number.value)))
+        finally:
+            # El modal difiere una respuesta privada: elimina el indicador de
+            # espera sin publicar otro mensaje de "iniciando".
+            try:
+                await interaction.delete_original_response()
+            except (discord.HTTPException, discord.NotFound):
+                pass
 
 
 class RouletteOptionButton(discord.ui.Button):
@@ -417,7 +384,7 @@ class SimplePanel(discord.ui.LayoutView):
                        ("XP laboral", "📈", "exp"))
         else:
             container.add_item(discord.ui.TextDisplay(
-                "## 🛰️ Consultar\nTodas las consultas son privadas."
+                "## 🛰️ Consultar\nPanel de consultas Purplejack"
             ))
             buttons = (("Balance", "💰", "balance"),
                        ("Inventario", "🎒", "inventario"),
@@ -425,12 +392,9 @@ class SimplePanel(discord.ui.LayoutView):
                        ("Top", "🏆", "top"),
                        ("Time", "🕒", "time"),
                        ("Info", "🔎", "info"))
-        for group in (buttons[:4], buttons[4:]):
-            if not group:
-                continue
+        for label, emoji, mode in buttons:
             row = discord.ui.ActionRow()
-            for label, emoji, mode in group:
-                row.add_item(SimplePanelButton(label, emoji, mode))
+            row.add_item(SimplePanelButton(label, emoji, mode))
             container.add_item(row)
         self.add_item(container)
 

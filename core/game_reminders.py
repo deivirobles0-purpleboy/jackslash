@@ -17,6 +17,107 @@ GAME_NAMES = {
 }
 
 
+class ReminderPrompt(discord.ui.LayoutView):
+    """Oferta temporal de aviso, mostrada solo tras finalizar una partida."""
+
+    def __init__(self, user_id: int, game: str, expires_at: float):
+        super().__init__(timeout=15)
+        self.user_id = user_id
+        self.game = game
+        self.expires_at = expires_at
+        self.message: discord.Message | None = None
+        self._deletion_task: asyncio.Task | None = None
+        container = discord.ui.Container(accent_color=0x7B42D6)
+        container.add_item(discord.ui.TextDisplay(
+            f"<@{user_id}> ¿Quieres recibir un aviso por DM cuando "
+            f"**{GAME_NAMES[game]}** esté disponible <t:{int(expires_at)}:R>?"
+        ))
+        row = discord.ui.ActionRow()
+        row.add_item(ReminderAcceptButton())
+        container.add_item(row)
+        self.add_item(container)
+
+async def _delete_prompt_after(prompt: ReminderPrompt, delay: int) -> None:
+    await asyncio.sleep(delay)
+    prompt.stop()
+    if prompt.message is not None:
+        try:
+            await prompt.message.delete()
+        except (discord.HTTPException, discord.NotFound):
+            pass
+
+
+class ReminderAcceptButton(discord.ui.Button):
+    def __init__(self):
+        super().__init__(label="Avisarme por DM", emoji="🔔",
+                         style=discord.ButtonStyle.success)
+
+    async def callback(self, interaction: discord.Interaction):
+        prompt: ReminderPrompt = self.view
+        if interaction.user.id != prompt.user_id:
+            await interaction.response.send_message(
+                "Este recordatorio no es para ti.", ephemeral=True,
+            )
+            return
+        await interaction.response.defer()
+        try:
+            current_expiry = (
+                await database.get_command_cooldown("user", prompt.user_id, "memo")
+                if prompt.game == "memo"
+                else await database.get_game_cooldown(prompt.user_id, prompt.game)
+            )
+            if current_expiry != prompt.expires_at or current_expiry <= time.time():
+                await interaction.followup.send(
+                    "El cooldown de esta partida ya cambió o terminó.", ephemeral=True,
+                )
+                return
+            await set_reminder(prompt.user_id, prompt.game, prompt.expires_at)
+        except Exception:
+            logger.exception("No se pudo activar aviso de %s para %s", prompt.game, prompt.user_id)
+            await interaction.followup.send(
+                "No pude activar el aviso. Inténtalo más tarde.", ephemeral=True,
+            )
+            return
+        prompt.stop()
+        if prompt._deletion_task is not None:
+            prompt._deletion_task.cancel()
+        prompt.clear_items()
+        container = discord.ui.Container(accent_color=0x43B581)
+        container.add_item(discord.ui.TextDisplay(
+            f"✅ <@{prompt.user_id}> Te avisaré por DM cuando "
+            f"**{GAME_NAMES[prompt.game]}** esté disponible."
+        ))
+        prompt.add_item(container)
+        try:
+            await interaction.message.edit(view=prompt)
+        except (discord.HTTPException, discord.NotFound):
+            pass
+        await asyncio.sleep(3)
+        try:
+            await interaction.message.delete()
+        except (discord.HTTPException, discord.NotFound):
+            pass
+
+
+async def send_game_reminder_prompt(channel, user_id: int, game: str,
+                                    expires_at: float) -> None:
+    """No afecta la liquidación del juego si Discord o el aviso fallan."""
+    if channel is None or expires_at <= time.time():
+        return
+    try:
+        if await reminder_enabled(user_id, game, expires_at):
+            return
+        prompt = ReminderPrompt(user_id, game, expires_at)
+        prompt.message = await channel.send(
+            view=prompt,
+            allowed_mentions=discord.AllowedMentions(users=True, roles=False,
+                                                      everyone=False),
+        )
+        prompt._deletion_task = asyncio.create_task(_delete_prompt_after(prompt, 15))
+    except Exception:
+        logger.exception("No se pudo ofrecer aviso de %s a %s", game, user_id)
+
+
 async def init_game_reminders() -> None:
     async with database.pool.acquire() as conn:
         await conn.execute("""

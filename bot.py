@@ -3,12 +3,9 @@ import discord
 from discord.ext import commands
 from discord import app_commands
 import asyncio
-import os
-import sys
 import time
 import signal
 import logging
-from importlib.metadata import PackageNotFoundError, version
 from datetime import datetime, timedelta, timezone
 from urllib.parse import urlsplit
 
@@ -51,27 +48,11 @@ logging.getLogger("discord").addFilter(_VoiceWarningFilter())
 
 logger = logging.getLogger("purplejack")
 
-logger.info(f"discord.py version: {discord.__version__}")
-for package_name in ("Brotli", "brotlicffi"):
-    try:
-        logger.info("[SEGURIDAD] %s instalado: %s", package_name, version(package_name))
-    except PackageNotFoundError:
-        logger.info("[SEGURIDAD] %s no instalado", package_name)
-
-logger.info(
-    "[STARTUP:CONFIG] Python %s | token=%s | base_de_datos=%s | guild_id=%s",
-    sys.version.split()[0],
-    "presente" if os.getenv("PURPLESLASH_DISCORD_TOKEN") else "FALTA",
-    "presente" if os.getenv("PURPLESLASH_DATABASE_URL") else "FALTA",
-    "presente" if os.getenv("PURPLESLASH_GUILD_ID") else "FALTA",
-)
-
 from settings import TOKEN, DATABASE_URL, TEST_MODE
 try:
     from settings import GUILD_ID
 except ImportError:
     GUILD_ID = None
-logger.info("[STARTUP:CONFIG] Variables obligatorias validadas sin mostrar sus valores.")
 
 from core.database import (
     init_db, load_items_to_cache, load_cargos_to_cache,
@@ -99,9 +80,6 @@ from core.config import (
     LOG_RETENTION_CHANNEL_IDS, LOG_DELETE_DELAY_SECONDS,
     LOG_DELETE_BATCH_SIZE, LOG_CLEANUP_BACKLOG_DELAY_SECONDS,
 )
-logger.info("[STARTUP:IMPORT] Módulos base importados correctamente.")
-
-
 def _safe_startup_error(error: Exception) -> str:
     """Evita que un error de conexión imprima credenciales en los registros."""
     message = str(error)
@@ -119,19 +97,13 @@ def _safe_startup_error(error: Exception) -> str:
 
 
 async def _startup_step(label: str, operation):
-    """Registra inicio, duración, espera prolongada y fallo de cada etapa."""
-    logger.info("[STARTUP:BEGIN] %s", label)
+    """Registra esperas prolongadas y fallos de cada etapa sin exponer secretos."""
     started = time.monotonic()
     task = asyncio.create_task(operation, name=f"startup-{label}")
     try:
         while True:
             try:
-                result = await asyncio.wait_for(asyncio.shield(task), timeout=20)
-                logger.info(
-                    "[STARTUP:OK] %s completado en %.1fs",
-                    label, time.monotonic() - started,
-                )
-                return result
+                return await asyncio.wait_for(asyncio.shield(task), timeout=20)
             except asyncio.TimeoutError:
                 logger.warning(
                     "[STARTUP:WAIT] %s sigue esperando tras %.0fs",
@@ -240,7 +212,6 @@ class PurpleJackCommandTree(app_commands.CommandTree):
         await interaction.response.send_message(message, ephemeral=True)
         return False
 
-logger.info("[STARTUP:BOT] Construyendo instancia de Discord...")
 bot = commands.Bot(
     command_prefix=get_prefix,
     intents=intents,
@@ -249,7 +220,6 @@ bot = commands.Bot(
     chunk_guilds_at_startup=False,
     tree_cls=PurpleJackCommandTree,
 )
-logger.info("[STARTUP:BOT] Instancia de Discord creada correctamente.")
 
 
 @bot.event
@@ -885,18 +855,11 @@ def _register_shutdown_signal(loop: asyncio.AbstractEventLoop) -> bool:
             "El arranque continuará.", type(error).__name__,
         )
         return False
-    logger.info("[STARTUP:SIGNAL] SIGTERM registrado.")
     return True
 
 
-logger.info("[STARTUP:IMPORT] bot.py cargado por completo.")
-
-
 def run_bot():
-    logger.info("[STARTUP:RUN] Preparando event loop principal...")
-
     async def main():
-        logger.info("[STARTUP:MAIN] Event loop activo; iniciando secuencia.")
         loop = asyncio.get_running_loop()
         _register_shutdown_signal(loop)
 
@@ -932,7 +895,6 @@ def run_bot():
         ):
             await _startup_step(label, startup_call())
         await _startup_step("Carga de extensiones", load_modules())
-        logger.info("[STARTUP:DISCORD] Iniciando login y conexión Gateway...")
         try:
             await bot.start(TOKEN)
         except Exception as error:
@@ -953,5 +915,4 @@ def run_bot():
 
 
 if __name__ == "__main__":
-    logger.info("[STARTUP:ENTRY] bot.py inició run_bot directamente.")
     run_bot()

@@ -485,7 +485,7 @@ class TiendaLayout(discord.ui.LayoutView):
 
         container.add_item(discord.ui.TextDisplay(
             f"## 🛒 TIENDA - NAVE SUS\n"
-            f"<@{self.author_id}> Compra el item de tu preferencia o Usa `!info [nombre]` para ver la info completa del item.\n"
+            f"<@{self.author_id}> Compra el item de tu preferencia o abre **/consultar** → **Info** para ver sus detalles.\n"
         ))
         container.add_item(discord.ui.Separator())
 
@@ -884,7 +884,7 @@ class UseButton(discord.ui.Button):
                 )
             if consumption.get("cd_boost"):
                 mensaje += (
-                    "\n⚡ Cooldowns de **!work, !crime, !dados y !rob** "
+                    "\n⚡ Cooldowns de **/work, /crime, Dados (/jugar) y /rob** "
                     "reducidos al **50%** hasta "
                     f"<t:{int(consumption['cd_boost']['expires_at'])}:F>."
                 )
@@ -1149,7 +1149,7 @@ class Shop(commands.Cog):
                         channel = await self.bot.fetch_channel(ITEM_EXPIRATION_CHANNEL_ID)
                     if hasattr(channel, "send"):
                         await channel.send(
-                            "Varios items vencidos fueron retirados y reestablecidos al Stock en **!tienda** 😉"
+                            "Varios items vencidos fueron retirados y reestablecidos al Stock en **/tienda** 😉"
                         )
                 if retiradas:
                     logger.info(
@@ -1199,7 +1199,7 @@ class Shop(commands.Cog):
     @commands.command()
     async def info(self, ctx, *, nombre: str = None):
         if nombre is None:
-            return await ctx.send(f"❌ Formato: `!info {{nombre del item}}`")
+            return await ctx.send("❌ Abre **/consultar** → **Info** e indica el nombre del artículo.")
 
         item = await get_item_by_name(nombre)
         if not item:

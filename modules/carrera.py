@@ -575,7 +575,7 @@ class Carrera(commands.Cog):
             return await ctx.send(f"❌ {ctx.author.mention} El sistema de carreras está desactivado.")
 
         if monto is None:
-            return await ctx.send(f"❌ {ctx.author.mention} Formato correcto: `!carrera {{monto}}`")
+            return await ctx.send(f"❌ {ctx.author.mention} Usa **/carrera apuesta**.")
 
         if monto < 100:
             return await ctx.message.reply(
@@ -704,7 +704,7 @@ class Carrera(commands.Cog):
     @carrera.error
     async def carrera_error(self, ctx, error):
         if isinstance(error, commands.MissingRequiredArgument):
-            await ctx.send(f"❌ {ctx.author.mention} Formato correcto: `!carrera {{monto}}`")
+            await ctx.send(f"❌ {ctx.author.mention} Usa **/carrera apuesta**.")
         elif isinstance(error, commands.CommandOnCooldown):
             retry = int(error.retry_after)
             tiempo = f"{retry // 60}m {retry % 60}s" if retry >= 60 else f"{retry}s"
