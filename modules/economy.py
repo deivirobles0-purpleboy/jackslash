@@ -570,7 +570,7 @@ class FinanceView(ui.View):
                 "❌ No es tu menú.", ephemeral=True
             )
         await interaction.response.send_modal(
-            DepositModal(self.user_id, interaction.message)
+            DepositModal(self.user_id, self.message)
         )
 
     @ui.button(label="Retirar", style=ButtonStyle.primary)
@@ -580,7 +580,7 @@ class FinanceView(ui.View):
                 "❌ No es tu menú.", ephemeral=True
             )
         await interaction.response.send_modal(
-            WithdrawModal(self.user_id, interaction.message)
+            WithdrawModal(self.user_id, self.message)
         )
 
     @ui.button(label="Craft", style=ButtonStyle.secondary)
@@ -611,6 +611,23 @@ class FinanceView(ui.View):
             logger.warning("No se pudo cerrar el panel de Balance de %s", self.user_id)
 
 
+async def _refresh_finance_message(message, user: dict) -> bool:
+    """Actualiza el webhook efímero; un panel vencido no revierte la operación."""
+    if message is None or not message.embeds:
+        return False
+    embed = message.embeds[0].copy()
+    embed.set_field_at(0, name=embed.fields[0].name,
+                       value=f"{user['balance']} {COIN}", inline=True)
+    embed.set_field_at(1, name=embed.fields[1].name,
+                       value=f"{user['bank']} {COIN}", inline=True)
+    try:
+        await message.edit(embed=embed)
+    except discord.HTTPException as error:
+        logger.warning("No se pudo actualizar el panel de Balance: %s", error)
+        return False
+    return True
+
+
 class DepositModal(ui.Modal, title="Depositar al Banco"):
     amount = ui.TextInput(label="¿Cuánto deseas depositar?", placeholder="Ej: 500 o All")
 
@@ -620,6 +637,7 @@ class DepositModal(ui.Modal, title="Depositar al Banco"):
         self.message = message
 
     async def on_submit(self, interaction: Interaction):
+        await interaction.response.defer(ephemeral=True)
         try:
             # Una sola llamada — get_user es cache-first, sin hit extra a DB
             user = await get_user(self.user_id)
@@ -627,18 +645,18 @@ class DepositModal(ui.Modal, title="Depositar al Banco"):
             amount = user["balance"] if raw == "all" else int(raw)
 
             if amount <= 0:
-                return await interaction.response.send_message(
+                return await interaction.followup.send(
                     "❌ Cantidad inválida.", ephemeral=True
                 )
             if amount > user["balance"]:
-                return await interaction.response.send_message(
+                return await interaction.followup.send(
                     "❌ No tienes suficiente balance.", ephemeral=True
                 )
 
             # Validar límite de banco antes de proceder
             banco_actual = user["bank"]
             if banco_actual >= MAX_BANK:
-                return await interaction.response.send_message(
+                return await interaction.followup.send(
                     f"🏦 Tu banco ya está al límite máximo ({MAX_BANK:,} {COIN}).\n"
                     f"Retira fondos antes de depositar.",
                     ephemeral=True
@@ -658,24 +676,23 @@ class DepositModal(ui.Modal, title="Depositar al Banco"):
 
             # Refrescar datos para actualizar el embed
             user = await get_user(self.user_id)
-            embed = self.message.embeds[0]
-            embed.set_field_at(0, name=embed.fields[0].name,
-                               value=f"{user['balance']} {COIN}", inline=True)
-            embed.set_field_at(1, name=embed.fields[1].name,
-                               value=f"{user['bank']} {COIN}",    inline=True)
-            await self.message.edit(embed=embed)
+            refreshed = await _refresh_finance_message(self.message, user)
 
             # Informar distribución si el banco se llenó durante el depósito
             if excedente_balance > 0:
-                await interaction.response.send_message(
+                await interaction.followup.send(
                     f"🏦 Banco lleno: **{aplicado_banco:,}** {COIN} depositados al banco.\n"
                     f"💰 **{excedente_balance:,}** {COIN} quedaron en tu balance.",
                     ephemeral=True
                 )
-            else:
-                await interaction.response.defer()
+            elif not refreshed:
+                await interaction.followup.send(
+                    f"✅ Depósito realizado. Balance: **{user['balance']}** {COIN} · "
+                    f"Banco: **{user['bank']}** {COIN}.",
+                    ephemeral=True,
+                )
         except ValueError:
-            await interaction.response.send_message(
+            await interaction.followup.send(
                 "❌ Ingresa un número válido.", ephemeral=True
             )
 
@@ -689,6 +706,7 @@ class WithdrawModal(ui.Modal, title="Retirar del Banco"):
         self.message = message
 
     async def on_submit(self, interaction: Interaction):
+        await interaction.response.defer(ephemeral=True)
         try:
             # Una sola llamada — get_user es cache-first, sin hit extra a DB
             user = await get_user(self.user_id)
@@ -696,11 +714,11 @@ class WithdrawModal(ui.Modal, title="Retirar del Banco"):
             amount = user["bank"] if raw == "all" else int(raw)
 
             if amount <= 0:
-                return await interaction.response.send_message(
+                return await interaction.followup.send(
                     "❌ Cantidad inválida.", ephemeral=True
                 )
             if amount > user["bank"]:
-                return await interaction.response.send_message(
+                return await interaction.followup.send(
                     "❌ No tienes suficiente en el banco.", ephemeral=True
                 )
 
@@ -708,15 +726,14 @@ class WithdrawModal(ui.Modal, title="Retirar del Banco"):
             await update_balance(self.user_id, amount, track_event=False)
 
             user = await get_user(self.user_id)
-            embed = self.message.embeds[0]
-            embed.set_field_at(0, name=embed.fields[0].name,
-                               value=f"{user['balance']} {COIN}", inline=True)
-            embed.set_field_at(1, name=embed.fields[1].name,
-                               value=f"{user['bank']} {COIN}",    inline=True)
-            await self.message.edit(embed=embed)
-            await interaction.response.defer()
+            if not await _refresh_finance_message(self.message, user):
+                await interaction.followup.send(
+                    f"✅ Retiro realizado. Balance: **{user['balance']}** {COIN} · "
+                    f"Banco: **{user['bank']}** {COIN}.",
+                    ephemeral=True,
+                )
         except ValueError:
-            await interaction.response.send_message(
+            await interaction.followup.send(
                 "❌ Ingresa un número válido.", ephemeral=True
             )
 

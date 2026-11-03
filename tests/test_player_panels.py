@@ -196,6 +196,112 @@ class PanelTests(unittest.IsolatedAsyncioTestCase):
         interaction.response.defer.assert_awaited_once()
         view.message.delete.assert_awaited_once()
 
+    async def test_withdraw_all_edits_saved_ephemeral_panel(self):
+        import discord
+        from modules.economy import FinanceView
+
+        embed = discord.Embed(title="Finanzas")
+        embed.add_field(name="Balance", value="10", inline=True)
+        embed.add_field(name="Banco", value="500", inline=True)
+        panel_message = SimpleNamespace(embeds=[embed], edit=AsyncMock())
+        view = FinanceView(42)
+        view.message = panel_message
+        button = next(child for child in view.children if child.label == "Retirar")
+        click = SimpleNamespace(
+            user=SimpleNamespace(id=42),
+            message=SimpleNamespace(edit=AsyncMock()),
+            response=SimpleNamespace(send_modal=AsyncMock()),
+        )
+        await button.callback(click)
+        modal = click.response.send_modal.await_args.args[0]
+        self.assertIs(modal.message, panel_message)
+        modal.amount._value = "all"
+        submit = SimpleNamespace(
+            response=SimpleNamespace(defer=AsyncMock()),
+            followup=SimpleNamespace(send=AsyncMock()),
+        )
+        with patch("modules.economy.get_user", new=AsyncMock(side_effect=[
+            {"balance": 10, "bank": 500}, {"balance": 510, "bank": 0},
+        ])), patch("modules.economy.update_bank", new=AsyncMock()) as bank, \
+             patch("modules.economy.update_balance", new=AsyncMock()) as balance:
+            await modal.on_submit(submit)
+        bank.assert_awaited_once_with(42, -500)
+        balance.assert_awaited_once_with(42, 500, track_event=False)
+        submit.response.defer.assert_awaited_once_with(ephemeral=True)
+        panel_message.edit.assert_awaited_once()
+        click.message.edit.assert_not_awaited()
+        submit.followup.send.assert_not_awaited()
+
+    async def test_deposit_all_edits_saved_ephemeral_panel(self):
+        import discord
+        from modules.economy import FinanceView
+
+        embed = discord.Embed(title="Finanzas")
+        embed.add_field(name="Balance", value="500", inline=True)
+        embed.add_field(name="Banco", value="10", inline=True)
+        panel_message = SimpleNamespace(embeds=[embed], edit=AsyncMock())
+        view = FinanceView(42)
+        view.message = panel_message
+        button = next(child for child in view.children if child.label == "Depositar")
+        click = SimpleNamespace(
+            user=SimpleNamespace(id=42),
+            message=SimpleNamespace(edit=AsyncMock()),
+            response=SimpleNamespace(send_modal=AsyncMock()),
+        )
+        await button.callback(click)
+        modal = click.response.send_modal.await_args.args[0]
+        self.assertIs(modal.message, panel_message)
+        modal.amount._value = "all"
+        submit = SimpleNamespace(
+            response=SimpleNamespace(defer=AsyncMock()),
+            followup=SimpleNamespace(send=AsyncMock()),
+        )
+        with patch("modules.economy.get_user", new=AsyncMock(side_effect=[
+            {"balance": 500, "bank": 10}, {"balance": 0, "bank": 510},
+        ])), patch("modules.economy.update_bank", new=AsyncMock(return_value=500)) as bank, \
+             patch("modules.economy.update_balance", new=AsyncMock()) as balance, \
+             patch("modules.economy.cache.record_evento_balance_delta") as event:
+            await modal.on_submit(submit)
+        balance.assert_awaited_once_with(42, -500, track_event=False)
+        bank.assert_awaited_once_with(42, 500, track_event=False)
+        event.assert_called_once()
+        submit.response.defer.assert_awaited_once_with(ephemeral=True)
+        panel_message.edit.assert_awaited_once()
+        click.message.edit.assert_not_awaited()
+        submit.followup.send.assert_not_awaited()
+
+    async def test_withdraw_all_confirms_when_panel_was_removed(self):
+        import discord
+        from modules.economy import WithdrawModal
+
+        embed = discord.Embed(title="Finanzas")
+        embed.add_field(name="Balance", value="10", inline=True)
+        embed.add_field(name="Banco", value="500", inline=True)
+        missing = discord.NotFound(
+            SimpleNamespace(status=404, reason="Not Found"), "Unknown Message",
+        )
+        panel_message = SimpleNamespace(
+            embeds=[embed], edit=AsyncMock(side_effect=missing),
+        )
+        modal = WithdrawModal(42, panel_message)
+        modal.amount._value = "all"
+        submit = SimpleNamespace(
+            response=SimpleNamespace(defer=AsyncMock()),
+            followup=SimpleNamespace(send=AsyncMock()),
+        )
+        with patch("modules.economy.get_user", new=AsyncMock(side_effect=[
+            {"balance": 10, "bank": 500}, {"balance": 510, "bank": 0},
+        ])), patch("modules.economy.update_bank", new=AsyncMock()) as bank, \
+             patch("modules.economy.update_balance", new=AsyncMock()) as balance:
+            await modal.on_submit(submit)
+        bank.assert_awaited_once_with(42, -500)
+        balance.assert_awaited_once_with(42, 500, track_event=False)
+        self.assertIn("Retiro realizado", submit.followup.send.await_args.args[0])
+
+    def test_bot_has_no_callable_text_prefix(self):
+        from bot import bot
+        self.assertEqual(bot.command_prefix, [])
+
     async def test_slash_context_uses_first_public_followup(self):
         interaction = SimpleNamespace(
             id=456, user=SimpleNamespace(id=1), guild=object(), client=object(),

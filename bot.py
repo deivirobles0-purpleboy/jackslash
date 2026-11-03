@@ -131,11 +131,6 @@ intents.message_content = False
 intents.members = False
 intents.messages = False
 
-async def get_prefix(bot, message):
-    """PurpleSlash no registra comandos de texto con prefijo."""
-    return []
-
-
 async def check_player_access(interaction: discord.Interaction) -> bool:
     """Protege tanto los paneles slash como cada botón que ejecuta acciones."""
     async def deny(message: str) -> bool:
@@ -213,7 +208,7 @@ class PurpleJackCommandTree(app_commands.CommandTree):
         return False
 
 bot = commands.Bot(
-    command_prefix=get_prefix,
+    command_prefix=[],
     intents=intents,
     help_command=None,
     member_cache_flags=discord.MemberCacheFlags.none(),
