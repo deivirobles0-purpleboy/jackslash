@@ -172,6 +172,24 @@ class PanelTests(unittest.IsolatedAsyncioTestCase):
         tree.clear_commands.assert_not_called()
         self.assertEqual(tree.sync.await_count, 1)
 
+    async def test_startup_diagnostics_report_stage_without_secrets(self):
+        import bot as bot_module
+
+        async def healthy():
+            return 42
+
+        async def broken():
+            raise RuntimeError(f"falló con {bot_module.TOKEN}")
+
+        self.assertEqual(await bot_module._startup_step("prueba correcta", healthy()), 42)
+        with self.assertLogs("purplejack", level="ERROR") as captured:
+            with self.assertRaises(RuntimeError) as raised:
+                await bot_module._startup_step("prueba fallida", broken())
+        self.assertIn("[STARTUP:ERROR] prueba fallida", captured.output[0])
+        self.assertIn("[REDACTADO]", captured.output[0])
+        self.assertNotIn(bot_module.TOKEN, captured.output[0])
+        self.assertNotIn(bot_module.TOKEN, str(raised.exception))
+
     def test_help_lists_only_available_slash_entry_points(self):
         from modules.economy import (
             NAVE_COMMAND_PAGES, NAVE_INFO_DESCRIPTION,

@@ -3,11 +3,14 @@ import discord
 from discord.ext import commands
 from discord import app_commands
 import asyncio
+import os
+import sys
 import time
 import signal
 import logging
 from importlib.metadata import PackageNotFoundError, version
 from datetime import datetime, timedelta, timezone
+from urllib.parse import urlsplit
 
 # ── LOGGING ────────────────────────────────────────────
 
@@ -55,11 +58,20 @@ for package_name in ("Brotli", "brotlicffi"):
     except PackageNotFoundError:
         logger.info("[SEGURIDAD] %s no instalado", package_name)
 
-from settings import TOKEN, TEST_MODE
+logger.info(
+    "[STARTUP:CONFIG] Python %s | token=%s | base_de_datos=%s | guild_id=%s",
+    sys.version.split()[0],
+    "presente" if os.getenv("PURPLESLASH_DISCORD_TOKEN") else "FALTA",
+    "presente" if os.getenv("PURPLESLASH_DATABASE_URL") else "FALTA",
+    "presente" if os.getenv("PURPLESLASH_GUILD_ID") else "FALTA",
+)
+
+from settings import TOKEN, DATABASE_URL, TEST_MODE
 try:
     from settings import GUILD_ID
 except ImportError:
     GUILD_ID = None
+logger.info("[STARTUP:CONFIG] Variables obligatorias validadas sin mostrar sus valores.")
 
 from core.database import (
     init_db, load_items_to_cache, load_cargos_to_cache,
@@ -87,6 +99,60 @@ from core.config import (
     LOG_RETENTION_CHANNEL_IDS, LOG_DELETE_DELAY_SECONDS,
     LOG_DELETE_BATCH_SIZE, LOG_CLEANUP_BACKLOG_DELAY_SECONDS,
 )
+logger.info("[STARTUP:IMPORT] Módulos base importados correctamente.")
+
+
+def _safe_startup_error(error: Exception) -> str:
+    """Evita que un error de conexión imprima credenciales en los registros."""
+    message = str(error)
+    secrets = [TOKEN, DATABASE_URL]
+    try:
+        password = urlsplit(DATABASE_URL).password
+        if password:
+            secrets.append(password)
+    except ValueError:
+        pass
+    for secret in secrets:
+        if secret:
+            message = message.replace(secret, "[REDACTADO]")
+    return message[:700]
+
+
+async def _startup_step(label: str, operation):
+    """Registra inicio, duración, espera prolongada y fallo de cada etapa."""
+    logger.info("[STARTUP:BEGIN] %s", label)
+    started = time.monotonic()
+    task = asyncio.create_task(operation, name=f"startup-{label}")
+    try:
+        while True:
+            try:
+                result = await asyncio.wait_for(asyncio.shield(task), timeout=20)
+                logger.info(
+                    "[STARTUP:OK] %s completado en %.1fs",
+                    label, time.monotonic() - started,
+                )
+                return result
+            except asyncio.TimeoutError:
+                logger.warning(
+                    "[STARTUP:WAIT] %s sigue esperando tras %.0fs",
+                    label, time.monotonic() - started,
+                )
+    except BaseException as error:
+        if not task.done():
+            task.cancel()
+        if isinstance(error, Exception):
+            safe_error = _safe_startup_error(error)
+            logger.error(
+                "[STARTUP:ERROR] %s: %s: %s",
+                label, type(error).__name__, safe_error,
+            )
+            raise RuntimeError(
+                f"Inicio fallido en {label}: {type(error).__name__}: {safe_error}"
+            ) from None
+        else:
+            logger.warning("[STARTUP:CANCELLED] %s", label)
+        raise
+
 
 intents = discord.Intents.default()
 intents.message_content = False
@@ -272,22 +338,15 @@ async def track_interaction_activity(interaction: discord.Interaction):
 
 
 async def load_modules():
-    await bot.load_extension("modules.economy")
-    await bot.load_extension("modules.basic_games")
-    await bot.load_extension("modules.staff")
-    await bot.load_extension("modules.roulette")
-    await bot.load_extension("modules.rob")
-    await bot.load_extension("modules.shop")
-    await bot.load_extension("modules.Empleos")
-    await bot.load_extension("modules.collect")
-    await bot.load_extension("modules.dados")
-    await bot.load_extension("modules.duels")
-    await bot.load_extension("modules.golpear")
-    await bot.load_extension("modules.carrera")
-    await bot.load_extension("modules.memo")
-    await bot.load_extension("modules.blackjack")
-    await bot.load_extension("modules.player_panels")
-    await bot.load_extension("modules.player_commands")
+    for extension in (
+        "modules.economy", "modules.basic_games", "modules.staff",
+        "modules.roulette", "modules.rob", "modules.shop",
+        "modules.Empleos", "modules.collect", "modules.dados",
+        "modules.duels", "modules.golpear", "modules.carrera",
+        "modules.memo", "modules.blackjack", "modules.player_panels",
+        "modules.player_commands",
+    ):
+        await _startup_step(f"Extensión {extension}", bot.load_extension(extension))
 
 
 async def _alertar_fallo_retiro_cargo(cargo: dict, error: Exception, intento: int):
@@ -818,37 +877,50 @@ def run_bot():
         loop = asyncio.get_running_loop()
         loop.add_signal_handler(signal.SIGTERM, lambda: asyncio.create_task(shutdown()))
 
-        await init_db()
-        await init_halloween_tables()
-        await init_game_reminders()
-        reembolsadas = await recover_pending_wagers()
+        await _startup_step("PostgreSQL y esquema", init_db())
+        await _startup_step("Tablas Halloween", init_halloween_tables())
+        await _startup_step("Tabla de recordatorios", init_game_reminders())
+        reembolsadas = await _startup_step("Apuestas pendientes", recover_pending_wagers())
         if reembolsadas:
             logger.warning(
                 "Se reembolsaron %s apuestas vencidas al iniciar.",
                 reembolsadas,
             )
-        indexed_balances = await load_balance_index()
+        indexed_balances = await _startup_step("Índice de balances", load_balance_index())
         logger.info(
             "Índice económico en RAM iniciado con %s usuario(s).",
             indexed_balances,
         )
-        indexed_names = await load_member_names()
+        indexed_names = await _startup_step("Caché de nombres", load_member_names())
         logger.info("Caché ligera de nombres iniciada con %s usuario(s).", indexed_names)
-        await ensure_wager_constraints()
-        await create_game_config_table()
-        await load_game_config()
-        await load_dados_config()
-        await load_memo_config()
-        await load_items_to_cache()
-        await load_cargos_to_cache()
-        await load_item_role_restrictions_to_cache()
-        await load_collect_config_to_cache()
-        await load_veterano_config_to_cache()
-        await load_saboteador_config_to_cache()
-        await load_evento_to_cache()
-        await load_modules()
+        for label, startup_call in (
+            ("Restricciones de apuestas", ensure_wager_constraints),
+            ("Tabla de configuración de juegos", create_game_config_table),
+            ("Configuración general", load_game_config),
+            ("Configuración Dados", load_dados_config),
+            ("Configuración Memo", load_memo_config),
+            ("Caché de artículos", load_items_to_cache),
+            ("Caché de cargos", load_cargos_to_cache),
+            ("Restricciones de artículos", load_item_role_restrictions_to_cache),
+            ("Configuración Collect", load_collect_config_to_cache),
+            ("Configuración Veterano", load_veterano_config_to_cache),
+            ("Configuración Saboteador", load_saboteador_config_to_cache),
+            ("Puntos de evento", load_evento_to_cache),
+        ):
+            await _startup_step(label, startup_call())
+        await _startup_step("Carga de extensiones", load_modules())
+        logger.info("[STARTUP:DISCORD] Iniciando login y conexión Gateway...")
         try:
             await bot.start(TOKEN)
+        except Exception as error:
+            safe_error = _safe_startup_error(error)
+            logger.error(
+                "[STARTUP:ERROR] Discord: %s: %s",
+                type(error).__name__, safe_error,
+            )
+            raise RuntimeError(
+                f"Inicio fallido en Discord: {type(error).__name__}: {safe_error}"
+            ) from None
         finally:
             await flush_evento_puntos()
             await cache.flush_to_db()
