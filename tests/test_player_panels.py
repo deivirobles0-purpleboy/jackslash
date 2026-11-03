@@ -5,7 +5,7 @@ import os
 from pathlib import Path
 from types import SimpleNamespace
 import unittest
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, Mock, patch
 
 os.environ.setdefault("PURPLESLASH_DISCORD_TOKEN", "test-token")
 os.environ.setdefault("PURPLESLASH_DATABASE_URL", "postgresql://test:test@localhost/test")
@@ -189,6 +189,20 @@ class PanelTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("[REDACTADO]", captured.output[0])
         self.assertNotIn(bot_module.TOKEN, captured.output[0])
         self.assertNotIn(bot_module.TOKEN, str(raised.exception))
+
+    def test_shutdown_signal_does_not_block_startup_when_unavailable(self):
+        import bot as bot_module
+
+        supported = SimpleNamespace(add_signal_handler=Mock())
+        self.assertTrue(bot_module._register_shutdown_signal(supported))
+        supported.add_signal_handler.assert_called_once()
+
+        unsupported = SimpleNamespace(
+            add_signal_handler=Mock(side_effect=NotImplementedError),
+        )
+        with self.assertLogs("purplejack", level="WARNING") as captured:
+            self.assertFalse(bot_module._register_shutdown_signal(unsupported))
+        self.assertIn("[STARTUP:SIGNAL]", captured.output[0])
 
     def test_help_lists_only_available_slash_entry_points(self):
         from modules.economy import (

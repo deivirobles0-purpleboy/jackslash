@@ -240,6 +240,7 @@ class PurpleJackCommandTree(app_commands.CommandTree):
         await interaction.response.send_message(message, ephemeral=True)
         return False
 
+logger.info("[STARTUP:BOT] Construyendo instancia de Discord...")
 bot = commands.Bot(
     command_prefix=get_prefix,
     intents=intents,
@@ -248,6 +249,7 @@ bot = commands.Bot(
     chunk_guilds_at_startup=False,
     tree_cls=PurpleJackCommandTree,
 )
+logger.info("[STARTUP:BOT] Instancia de Discord creada correctamente.")
 
 
 @bot.event
@@ -871,11 +873,32 @@ async def on_ready():
         )
     logger.info("\n⫷ 𝙋𝙐𝙍𝙋𝙇𝙀𝙅𝘼𝘾𝙆 𝙀𝙉 𝙇𝙄𝙉𝙀𝘼 ⫸\n")
 
+def _register_shutdown_signal(loop: asyncio.AbstractEventLoop) -> bool:
+    """La señal es opcional en entornos donde el event loop la restringe."""
+    try:
+        loop.add_signal_handler(
+            signal.SIGTERM, lambda: asyncio.create_task(shutdown()),
+        )
+    except (NotImplementedError, RuntimeError, ValueError) as error:
+        logger.warning(
+            "[STARTUP:SIGNAL] SIGTERM no disponible: %s. "
+            "El arranque continuará.", type(error).__name__,
+        )
+        return False
+    logger.info("[STARTUP:SIGNAL] SIGTERM registrado.")
+    return True
+
+
+logger.info("[STARTUP:IMPORT] bot.py cargado por completo.")
+
+
 def run_bot():
+    logger.info("[STARTUP:RUN] Preparando event loop principal...")
+
     async def main():
-        # ── Handler de señal SIGTERM (ej: SquareCloud apagando el proceso) ──
+        logger.info("[STARTUP:MAIN] Event loop activo; iniciando secuencia.")
         loop = asyncio.get_running_loop()
-        loop.add_signal_handler(signal.SIGTERM, lambda: asyncio.create_task(shutdown()))
+        _register_shutdown_signal(loop)
 
         await _startup_step("PostgreSQL y esquema", init_db())
         await _startup_step("Tablas Halloween", init_halloween_tables())
