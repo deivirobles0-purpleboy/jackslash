@@ -84,12 +84,16 @@ class PanelTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertTrue(all(len(row.children) == 1 for row in rows))
 
-    def test_consult_panel_stacks_its_buttons(self):
+    def test_consult_panel_uses_two_columns_of_three_buttons(self):
         panel = SimplePanel(1, "consultar")
         rows = [child for child in panel.children[0].children
                 if child.__class__.__name__ == "ActionRow"]
-        self.assertEqual(len(rows), 6)
-        self.assertTrue(all(len(row.children) == 1 for row in rows))
+        self.assertEqual(len(rows), 3)
+        self.assertTrue(all(len(row.children) == 2 for row in rows))
+        self.assertEqual(
+            [[button.mode for button in row.children] for row in rows],
+            [["balance", "inventario"], ["cd", "top"], ["time", "info"]],
+        )
         self.assertIn("Panel de consultas Purplejack", str(panel.to_components()))
 
     def test_game_panel_has_no_redundant_start_notice(self):

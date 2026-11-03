@@ -429,10 +429,12 @@ class SimplePanel(discord.ui.LayoutView):
                        ("Top", "🏆", "top"),
                        ("Time", "🕒", "time"),
                        ("Info", "🔎", "info"))
-        for label, emoji, mode in buttons:
-            row = discord.ui.ActionRow()
+        row = None
+        for index, (label, emoji, mode) in enumerate(buttons):
+            if kind == "trabajar" or index % 2 == 0:
+                row = discord.ui.ActionRow()
+                container.add_item(row)
             row.add_item(SimplePanelButton(label, emoji, mode))
-            container.add_item(row)
         self.add_item(container)
 
 
