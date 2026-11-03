@@ -33,6 +33,7 @@ EMPLEOS_THUMBNAIL = (
     "Purple%20jack%20Harcode/EmpleosPJ.png"
 )
 PANEL_LIFETIME_SECONDS = 60
+ROULETTE_OPTIONS_DELETE_DELAY = 2
 
 
 async def _delete_panel_after(view: discord.ui.LayoutView, message, delay: int) -> None:
@@ -47,6 +48,15 @@ async def _delete_panel_after(view: discord.ui.LayoutView, message, delay: int) 
         await message.delete()
     except (discord.HTTPException, discord.NotFound):
         pass
+
+
+async def _delete_roulette_options_after(view: "RouletteOptions") -> None:
+    await asyncio.sleep(ROULETTE_OPTIONS_DELETE_DELAY)
+    if view.message is not None:
+        try:
+            await view.message.delete()
+        except (discord.HTTPException, discord.NotFound):
+            pass
 
 
 async def _cooldown(user_id: int, game: str) -> float:
@@ -134,9 +144,11 @@ class GameButton(discord.ui.Button):
         if not await _owned(view, interaction):
             return
         if self.game == "ruleta":
-            await interaction.response.send_message(
+            await interaction.response.defer(ephemeral=True)
+            options = RouletteOptions(view)
+            options.message = await interaction.followup.send(
                 "🎰 Escoge una opción para la ruleta:",
-                view=RouletteOptions(view), ephemeral=True,
+                view=options, ephemeral=True, wait=True,
             )
         else:
             await interaction.response.defer(ephemeral=True)
@@ -301,13 +313,21 @@ class RouletteOptionButton(discord.ui.Button):
         self.option = option
 
     async def callback(self, interaction: discord.Interaction):
-        panel = self.view.panel
+        options: RouletteOptions = self.view
+        panel = options.panel
         if not await _owned(panel, interaction):
+            return
+        if options.closing:
+            await interaction.response.send_message(
+                "Esta selección ya fue procesada.", ephemeral=True,
+            )
             return
         if self.option == "numero":
             await interaction.response.send_modal(RouletteNumber(panel))
+            options.close_after_selection()
             return
         await interaction.response.defer(ephemeral=True)
+        options.close_after_selection()
         await panel.launch(interaction, "ruleta", self.option)
 
 
@@ -315,8 +335,18 @@ class RouletteOptions(discord.ui.View):
     def __init__(self, panel: GamePanel):
         super().__init__(timeout=120)
         self.panel = panel
+        self.message: discord.WebhookMessage | None = None
+        self.closing = False
+        self._delete_task: asyncio.Task | None = None
         for option in ("black", "red", "par", "impar", "numero"):
             self.add_item(RouletteOptionButton(option))
+
+    def close_after_selection(self) -> None:
+        if self.closing:
+            return
+        self.closing = True
+        self.stop()
+        self._delete_task = asyncio.create_task(_delete_roulette_options_after(self))
 
 
 class SimplePanelButton(discord.ui.Button):
@@ -443,7 +473,7 @@ class SimplePanel(discord.ui.LayoutView):
                        ("Info", "🔎", "info"))
         row = None
         for index, (label, emoji, mode) in enumerate(buttons):
-            if kind == "trabajar" or index % 2 == 0:
+            if index % 2 == 0:
                 row = discord.ui.ActionRow()
                 container.add_item(row)
             row.add_item(SimplePanelButton(label, emoji, mode))

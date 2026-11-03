@@ -15,6 +15,7 @@ os.environ.setdefault("PURPLESLASH_GUILD_ID", "980073134411644939")
 from modules.player_panels import (
     GamePanel, PanelContext, SimplePanel, RouletteNumber, _delete_panel_after,
     JUGAR_THUMBNAIL, CONSULTAR_THUMBNAIL, EMPLEOS_THUMBNAIL,
+    RouletteOptions,
 )
 
 
@@ -85,7 +86,8 @@ class PanelTests(unittest.IsolatedAsyncioTestCase):
             [button.mode for row in rows for button in row.children],
             ["trabajar", "aplicar", "renunciar", "oficina", "empleos", "exp"],
         )
-        self.assertTrue(all(len(row.children) == 1 for row in rows))
+        self.assertEqual(len(rows), 3)
+        self.assertTrue(all(len(row.children) == 2 for row in rows))
 
     def test_consult_panel_uses_two_columns_of_three_buttons(self):
         panel = SimplePanel(1, "consultar")
@@ -161,6 +163,73 @@ class PanelTests(unittest.IsolatedAsyncioTestCase):
         self.assertIs(prompt.message, message)
         prompt._deletion_task.cancel()
         await asyncio.gather(prompt._deletion_task, return_exceptions=True)
+
+    async def test_every_game_and_work_offer_waits_two_seconds(self):
+        from core.game_reminders import send_game_reminder_prompt
+
+        for game in ("ruleta", "dados", "bj", "memo", "trabajar"):
+            with self.subTest(game=game):
+                events = []
+                message = SimpleNamespace(delete=AsyncMock())
+
+                async def pause(seconds):
+                    events.append(("wait", seconds))
+
+                async def send(*args, **kwargs):
+                    events.append(("send", game))
+                    return message
+
+                interaction = SimpleNamespace(
+                    response=SimpleNamespace(is_done=Mock(return_value=True)),
+                    followup=SimpleNamespace(send=AsyncMock(side_effect=send)),
+                )
+                with patch("core.game_reminders.reminder_enabled",
+                           new=AsyncMock(return_value=False)), \
+                     patch("core.game_reminders.asyncio.sleep", new=pause):
+                    await send_game_reminder_prompt(
+                        interaction, 42, game, 9999999999,
+                    )
+                self.assertEqual(events, [("wait", 2), ("send", game)])
+                prompt = interaction.followup.send.await_args.kwargs["view"]
+                prompt._deletion_task.cancel()
+                await asyncio.gather(prompt._deletion_task, return_exceptions=True)
+
+    async def test_roulette_options_delete_two_seconds_after_choice(self):
+        options = RouletteOptions(GamePanel(42, 100, None))
+        options.message = SimpleNamespace(delete=AsyncMock())
+        options.close_after_selection()
+        self.assertTrue(options.closing)
+        self.assertTrue(options.is_finished())
+        with patch("modules.player_panels.asyncio.sleep", new=AsyncMock()) as sleep:
+            await options._delete_task
+        sleep.assert_awaited_once_with(2)
+        options.message.delete.assert_awaited_once()
+
+    async def test_roulette_selection_closes_menu_for_color_and_number(self):
+        for choice in ("black", "numero"):
+            with self.subTest(choice=choice):
+                panel = GamePanel(42, 100, None)
+                panel.launch = AsyncMock()
+                options = RouletteOptions(panel)
+                options.message = SimpleNamespace(delete=AsyncMock())
+                button = next(button for button in options.children
+                              if button.option == choice)
+                interaction = SimpleNamespace(
+                    response=SimpleNamespace(
+                        defer=AsyncMock(), send_modal=AsyncMock(),
+                    ),
+                )
+                with patch("modules.player_panels._owned", new=AsyncMock(return_value=True)), \
+                     patch("modules.player_panels.asyncio.sleep", new=AsyncMock()):
+                    await button.callback(interaction)
+                    await options._delete_task
+                options.message.delete.assert_awaited_once()
+                if choice == "numero":
+                    interaction.response.send_modal.assert_awaited_once()
+                    panel.launch.assert_not_awaited()
+                else:
+                    interaction.response.defer.assert_awaited_once_with(ephemeral=True)
+                    panel.launch.assert_awaited_once_with(interaction, "ruleta", choice)
 
     async def test_finance_exit_deletes_its_own_message(self):
         from modules.economy import FinanceView
