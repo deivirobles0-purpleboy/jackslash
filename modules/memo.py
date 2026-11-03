@@ -200,7 +200,7 @@ class MemoView(discord.ui.View):
                         asyncio.create_task(self._programar_eliminacion())
                         if expires_at is not None:
                             await send_game_reminder_prompt(
-                                interaction.channel, self.author.id, "memo", expires_at,
+                                interaction, self.author.id, "memo", expires_at,
                             )
                         return
 
@@ -235,7 +235,7 @@ class MemoView(discord.ui.View):
                     asyncio.create_task(self._programar_eliminacion())
                     if expires_at is not None:
                         await send_game_reminder_prompt(
-                            interaction.channel, self.author.id, "memo", expires_at,
+                            interaction, self.author.id, "memo", expires_at,
                         )
                     return
 

@@ -20,6 +20,29 @@ GAMES = {
     "bj": ("🃏 Blackjack", "Blackjack", "blackjack"),
     "memo": ("🧠 Memo", "Memo", "memo"),
 }
+JUGAR_THUMBNAIL = (
+    "https://pub-a09b3609b6b34dfab5c7aa7742cd1a8a.r2.dev/"
+    "Purple%20jack%20Harcode/jugar.png"
+)
+CONSULTAR_THUMBNAIL = (
+    "https://pub-a09b3609b6b34dfab5c7aa7742cd1a8a.r2.dev/"
+    "Purple%20jack%20Harcode/Consultar.png"
+)
+PANEL_LIFETIME_SECONDS = 60
+
+
+async def _delete_panel_after(view: discord.ui.LayoutView, message, delay: int) -> None:
+    """Cierra solo el menú; las partidas lanzadas continúan independientes."""
+    await asyncio.sleep(delay)
+    view.stop()
+    if isinstance(view, GamePanel):
+        view.expired = True
+        if view._poll_task is not None:
+            view._poll_task.cancel()
+    try:
+        await message.delete()
+    except (discord.HTTPException, discord.NotFound):
+        pass
 
 
 async def _cooldown(user_id: int, game: str) -> float:
@@ -125,6 +148,7 @@ class GamePanel(discord.ui.LayoutView):
         self.cooldowns: dict[str, float] = {}
         self._lock = asyncio.Lock()
         self._poll_task: asyncio.Task | None = None
+        self.expired = False
 
     async def refresh(self):
         for game in GAMES:
@@ -135,9 +159,14 @@ class GamePanel(discord.ui.LayoutView):
     def build(self):
         self.clear_items()
         container = discord.ui.Container(accent_color=0x7B42D6)
-        container.add_item(discord.ui.TextDisplay(
-            f"## 🎮 Juegos PurpleSlash\nApuesta seleccionada: **{self.bet}** PurpleCoin. "
-            "Escoge un juego; su tablero se publicará en el canal."
+        container.add_item(discord.ui.Section(
+            discord.ui.TextDisplay(
+                f"## 🎮 Juegos PurpleSlash\nApuesta seleccionada: **{self.bet}** PurpleCoin. "
+                "Escoge un juego; su tablero se publicará en el canal."
+            ),
+            accessory=discord.ui.Thumbnail(
+                JUGAR_THUMBNAIL, description="Mando de juegos PurpleSlash",
+            ),
         ))
         container.add_item(discord.ui.Separator())
         for game in GAMES:
@@ -148,6 +177,9 @@ class GamePanel(discord.ui.LayoutView):
         self.add_item(container)
 
     async def launch(self, interaction: discord.Interaction, game: str, option: str | None = None):
+        if self.expired:
+            await interaction.followup.send("Este panel ya venció. Abre /jugar nuevamente.", ephemeral=True)
+            return
         async with self._lock:
             expiry = await _cooldown(self.owner_id, game)
             if game in self.active or expiry > time.time():
@@ -196,12 +228,12 @@ class GamePanel(discord.ui.LayoutView):
                             await self.message.edit(view=self)
                         except discord.HTTPException:
                             pass
-                if self._poll_task is None or self._poll_task.done():
+                if not self.expired and (self._poll_task is None or self._poll_task.done()):
                     self._poll_task = asyncio.create_task(self._poll())
 
     async def _poll(self):
         deadline = time.monotonic() + 900
-        while time.monotonic() < deadline:
+        while not self.expired and time.monotonic() < deadline:
             upcoming = [expiry for expiry in self.cooldowns.values() if expiry > time.time()]
             delay = 2 if self.active else min(30, max(2, min(upcoming) - time.time())) if upcoming else 30
             await asyncio.sleep(delay)
@@ -383,8 +415,13 @@ class SimplePanel(discord.ui.LayoutView):
                        ("Empleos", "💼", "empleos"),
                        ("XP laboral", "📈", "exp"))
         else:
-            container.add_item(discord.ui.TextDisplay(
-                "## 🛰️ Consultar\nPanel de consultas Purplejack"
+            container.add_item(discord.ui.Section(
+                discord.ui.TextDisplay(
+                    "## 🛰️ Consultar\nPanel de consultas Purplejack"
+                ),
+                accessory=discord.ui.Thumbnail(
+                    CONSULTAR_THUMBNAIL, description="Consultas Purplejack",
+                ),
             ))
             buttons = (("Balance", "💰", "balance"),
                        ("Inventario", "🎒", "inventario"),
@@ -419,6 +456,9 @@ class PlayerPanels(commands.Cog):
             view=panel, ephemeral=True, wait=True,
         )
         panel._poll_task = asyncio.create_task(panel._poll())
+        asyncio.create_task(_delete_panel_after(
+            panel, panel.message, PANEL_LIFETIME_SECONDS,
+        ))
 
     @app_commands.command(name="trabajar", description="Abre el centro de empleos")
     async def trabajar(self, interaction: discord.Interaction):
@@ -428,9 +468,14 @@ class PlayerPanels(commands.Cog):
 
     @app_commands.command(name="consultar", description="Consulta tus datos y recursos")
     async def consultar(self, interaction: discord.Interaction):
-        await interaction.response.send_message(
-            view=SimplePanel(interaction.user.id, "consultar"), ephemeral=True,
+        await interaction.response.defer(ephemeral=True)
+        panel = SimplePanel(interaction.user.id, "consultar")
+        message = await interaction.followup.send(
+            view=panel, ephemeral=True, wait=True,
         )
+        asyncio.create_task(_delete_panel_after(
+            panel, message, PANEL_LIFETIME_SECONDS,
+        ))
 
 
 async def setup(bot):

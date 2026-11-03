@@ -1,6 +1,7 @@
 """Pruebas locales sin conexión a Discord ni a PostgreSQL."""
 
 import ast
+import asyncio
 import os
 from pathlib import Path
 from types import SimpleNamespace
@@ -11,7 +12,10 @@ os.environ.setdefault("PURPLESLASH_DISCORD_TOKEN", "test-token")
 os.environ.setdefault("PURPLESLASH_DATABASE_URL", "postgresql://test:test@localhost/test")
 os.environ.setdefault("PURPLESLASH_GUILD_ID", "980073134411644939")
 
-from modules.player_panels import GamePanel, PanelContext, SimplePanel, RouletteNumber
+from modules.player_panels import (
+    GamePanel, PanelContext, SimplePanel, RouletteNumber, _delete_panel_after,
+    JUGAR_THUMBNAIL, CONSULTAR_THUMBNAIL,
+)
 
 
 class PanelTests(unittest.IsolatedAsyncioTestCase):
@@ -23,6 +27,36 @@ class PanelTests(unittest.IsolatedAsyncioTestCase):
         game = GamePanel(1, 100, None)
         game.build()
         self.assertEqual(game.to_components()[0]["type"], 17)
+
+    def test_jugar_and_consultar_use_their_v2_thumbnails(self):
+        game = GamePanel(1, 100, None)
+        game.build()
+        for panel, expected in (
+            (game, JUGAR_THUMBNAIL),
+            (SimplePanel(1, "consultar"), CONSULTAR_THUMBNAIL),
+        ):
+            section = panel.to_components()[0]["components"][0]
+            self.assertEqual(section["type"], 9)
+            self.assertEqual(section["accessory"]["type"], 11)
+            self.assertEqual(section["accessory"]["media"]["url"], expected)
+
+    async def test_panel_autodelete_closes_menu_without_ending_game(self):
+        panel = GamePanel(1, 100, None)
+        panel.active.add("memo")
+        panel._poll_task = asyncio.create_task(asyncio.Event().wait())
+        message = SimpleNamespace(delete=AsyncMock())
+        await _delete_panel_after(panel, message, 0)
+        await asyncio.gather(panel._poll_task, return_exceptions=True)
+        self.assertTrue(panel.expired)
+        self.assertTrue(panel.is_finished())
+        self.assertEqual(panel.active, {"memo"})
+        message.delete.assert_awaited_once()
+
+        consult = SimplePanel(1, "consultar")
+        consult_message = SimpleNamespace(delete=AsyncMock())
+        await _delete_panel_after(consult, consult_message, 0)
+        self.assertTrue(consult.is_finished())
+        consult_message.delete.assert_awaited_once()
 
     async def test_cooldown_disables_game_without_panel_bells(self):
         game = GamePanel(1, 100, None)
@@ -75,6 +109,7 @@ class PanelTests(unittest.IsolatedAsyncioTestCase):
         prompt = ReminderPrompt(42, "dados", 9999999999)
         button = prompt.children[0].children[1].children[0]
         message = SimpleNamespace(edit=AsyncMock(), delete=AsyncMock())
+        prompt.message = message
         interaction = SimpleNamespace(
             user=SimpleNamespace(id=42),
             response=SimpleNamespace(defer=AsyncMock()),
@@ -99,6 +134,58 @@ class PanelTests(unittest.IsolatedAsyncioTestCase):
             await _delete_prompt_after(prompt, 15)
         sleep.assert_awaited_once_with(15)
         prompt.message.delete.assert_awaited_once()
+
+    async def test_reminder_offer_is_ephemeral(self):
+        from core.game_reminders import send_game_reminder_prompt
+        message = SimpleNamespace(edit=AsyncMock(), delete=AsyncMock())
+        interaction = SimpleNamespace(
+            response=SimpleNamespace(is_done=Mock(return_value=True)),
+            followup=SimpleNamespace(send=AsyncMock(return_value=message)),
+        )
+        with patch("core.game_reminders.reminder_enabled",
+                   new=AsyncMock(return_value=False)):
+            await send_game_reminder_prompt(interaction, 42, "dados", 9999999999)
+        kwargs = interaction.followup.send.await_args.kwargs
+        self.assertTrue(kwargs["ephemeral"])
+        self.assertTrue(kwargs["wait"])
+        prompt = kwargs["view"]
+        self.assertIs(prompt.message, message)
+        prompt._deletion_task.cancel()
+        await asyncio.gather(prompt._deletion_task, return_exceptions=True)
+
+    async def test_finance_exit_deletes_its_own_message(self):
+        from modules.economy import FinanceView
+        view = FinanceView(42)
+        view.message = SimpleNamespace(delete=AsyncMock())
+        button = next(child for child in view.children if child.label == "Salir")
+        interaction = SimpleNamespace(
+            user=SimpleNamespace(id=42),
+            response=SimpleNamespace(defer=AsyncMock()),
+            delete_original_response=AsyncMock(),
+            message=SimpleNamespace(delete=AsyncMock()),
+        )
+        await button.callback(interaction)
+        interaction.response.defer.assert_awaited_once()
+        view.message.delete.assert_awaited_once()
+        interaction.message.delete.assert_not_awaited()
+        interaction.delete_original_response.assert_not_awaited()
+
+    async def test_finance_exit_ignores_already_deleted_message(self):
+        import discord
+        from modules.economy import FinanceView
+        view = FinanceView(42)
+        missing = discord.NotFound(
+            SimpleNamespace(status=404, reason="Not Found"), "Unknown Message",
+        )
+        view.message = SimpleNamespace(delete=AsyncMock(side_effect=missing))
+        button = next(child for child in view.children if child.label == "Salir")
+        interaction = SimpleNamespace(
+            user=SimpleNamespace(id=42),
+            response=SimpleNamespace(defer=AsyncMock()),
+        )
+        await button.callback(interaction)
+        interaction.response.defer.assert_awaited_once()
+        view.message.delete.assert_awaited_once()
 
     async def test_slash_context_uses_first_public_followup(self):
         interaction = SimpleNamespace(
@@ -302,6 +389,7 @@ class PanelTests(unittest.IsolatedAsyncioTestCase):
                                    mention="<@1>"),
             message=SimpleNamespace(id=123),
             channel=SimpleNamespace(),
+            interaction=SimpleNamespace(),
             send=send,
         )
         with patch("modules.roulette.cache.get_game_cooldown_cache", return_value=0), \

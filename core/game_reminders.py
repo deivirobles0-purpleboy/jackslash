@@ -29,7 +29,7 @@ class ReminderPrompt(discord.ui.LayoutView):
         self._deletion_task: asyncio.Task | None = None
         container = discord.ui.Container(accent_color=0x7B42D6)
         container.add_item(discord.ui.TextDisplay(
-            f"<@{user_id}> ¿Quieres recibir un aviso por DM cuando "
+            f"¿Quieres recibir un aviso por DM cuando "
             f"**{GAME_NAMES[game]}** esté disponible <t:{int(expires_at)}:R>?"
         ))
         row = discord.ui.ActionRow()
@@ -89,29 +89,30 @@ class ReminderAcceptButton(discord.ui.Button):
         ))
         prompt.add_item(container)
         try:
-            await interaction.message.edit(view=prompt)
+            await prompt.message.edit(view=prompt)
         except (discord.HTTPException, discord.NotFound):
             pass
         await asyncio.sleep(3)
         try:
-            await interaction.message.delete()
+            await prompt.message.delete()
         except (discord.HTTPException, discord.NotFound):
             pass
 
 
-async def send_game_reminder_prompt(channel, user_id: int, game: str,
+async def send_game_reminder_prompt(interaction: discord.Interaction | None,
+                                    user_id: int, game: str,
                                     expires_at: float) -> None:
     """No afecta la liquidación del juego si Discord o el aviso fallan."""
-    if channel is None or expires_at <= time.time():
+    if interaction is None or expires_at <= time.time():
         return
     try:
         if await reminder_enabled(user_id, game, expires_at):
             return
         prompt = ReminderPrompt(user_id, game, expires_at)
-        prompt.message = await channel.send(
-            view=prompt,
-            allowed_mentions=discord.AllowedMentions(users=True, roles=False,
-                                                      everyone=False),
+        if not interaction.response.is_done():
+            await interaction.response.defer(ephemeral=True)
+        prompt.message = await interaction.followup.send(
+            view=prompt, ephemeral=True, wait=True,
         )
         prompt._deletion_task = asyncio.create_task(_delete_prompt_after(prompt, 15))
     except Exception:

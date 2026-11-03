@@ -91,6 +91,7 @@ class BlackjackGame:
         self.dealer: list[tuple[str, str]] = []
         self.cooldown = int(blackjack_config["cooldown"])
         self.message: discord.Message | None = None
+        self.source_interaction: discord.Interaction | None = None
         self.finished = False
         self.processing = False
         self.action_lock = asyncio.Lock()
@@ -299,12 +300,9 @@ class BlackjackView(discord.ui.View):
             if self.game.message is not None:
                 asyncio.create_task(self.game.message.delete(delay=120))
             if expires_at is not None:
-                channel = (
-                    getattr(self.game.message, "channel", None) if self.game.message is not None
-                    else interaction.channel if interaction is not None else None
-                )
                 await send_game_reminder_prompt(
-                    channel, self.game.user_id, "bj", expires_at,
+                    interaction or self.game.source_interaction,
+                    self.game.user_id, "bj", expires_at,
                 )
         except Exception as error:
             # Si la liquidación alcanzó a confirmarse, refund_wager no podrá
@@ -564,6 +562,7 @@ class Blackjack(commands.Cog):
                 apuesta,
                 wager["id"],
             )
+            game.source_interaction = getattr(ctx, "interaction", None)
             view = BlackjackView(game)
             _ACTIVE_BLACKJACK.add(ctx.author.id)
             try:

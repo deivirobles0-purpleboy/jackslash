@@ -209,7 +209,7 @@ class DadosRollView(discord.ui.View):
             except Exception:
                 pass
             await send_game_reminder_prompt(
-                interaction.channel, self.author_id, "dados", expira_en,
+                interaction, self.author_id, "dados", expira_en,
             )
 
 

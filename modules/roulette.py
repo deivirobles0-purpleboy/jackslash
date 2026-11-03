@@ -216,7 +216,9 @@ class Roulette(commands.Cog):
             await set_game_cooldown(user_id, "ruleta", expira_en)
             cache.set_game_cooldown_cache(user_id, "ruleta", expira_en)
             await ctx.send(embed=embed_resultado)
-            await send_game_reminder_prompt(ctx.channel, user_id, "ruleta", expira_en)
+            await send_game_reminder_prompt(
+                getattr(ctx, "interaction", None), user_id, "ruleta", expira_en,
+            )
         except Exception:
             await refund_wager(wager["id"])
             raise

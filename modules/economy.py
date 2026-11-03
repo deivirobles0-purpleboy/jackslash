@@ -561,6 +561,7 @@ class FinanceView(ui.View):
     def __init__(self, user_id):
         super().__init__(timeout=60)
         self.user_id = user_id
+        self.message: discord.Message | None = None
 
     @ui.button(label="Depositar", style=ButtonStyle.green)
     async def depositar(self, interaction: Interaction, button: ui.Button):
@@ -597,8 +598,17 @@ class FinanceView(ui.View):
             return await interaction.response.send_message(
                 "❌ No es tu menú.", ephemeral=True
             )
-        await interaction.message.delete()
         await interaction.response.defer()
+        self.stop()
+        try:
+            if self.message is not None:
+                await self.message.delete()
+            else:
+                await interaction.delete_original_response()
+        except discord.NotFound:
+            pass  # El panel ya fue cerrado o eliminado.
+        except discord.HTTPException:
+            logger.warning("No se pudo cerrar el panel de Balance de %s", self.user_id)
 
 
 class DepositModal(ui.Modal, title="Depositar al Banco"):
@@ -727,7 +737,8 @@ class Economy(commands.Cog):
         embed.add_field(name="🏦 Banco",        value=f"{user['bank']} {COIN}",    inline=True)
         embed.add_field(name="🎃 Dulces", value=f"{candy_balance} {CANDY}", inline=True)
         embed.set_thumbnail(url=ctx.author.display_avatar.url)
-        await ctx.message.reply(embed=embed, view=FinanceView(ctx.author.id), delete_after=120)
+        view = FinanceView(ctx.author.id)
+        view.message = await ctx.message.reply(embed=embed, view=view, delete_after=120)
 
     def format_cooldown(self, seconds: int) -> str:
         return _format_cooldown(seconds)
