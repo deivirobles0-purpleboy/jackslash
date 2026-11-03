@@ -28,6 +28,10 @@ CONSULTAR_THUMBNAIL = (
     "https://pub-a09b3609b6b34dfab5c7aa7742cd1a8a.r2.dev/"
     "Purple%20jack%20Harcode/Consultar.png"
 )
+EMPLEOS_THUMBNAIL = (
+    "https://pub-a09b3609b6b34dfab5c7aa7742cd1a8a.r2.dev/"
+    "Purple%20jack%20Harcode/EmpleosPJ.png"
+)
 PANEL_LIFETIME_SECONDS = 60
 
 
@@ -69,7 +73,7 @@ class PanelContext:
     """Compatibilidad transitoria con callbacks existentes, sin procesar mensajes !."""
 
     def __init__(self, interaction: discord.Interaction, *, private: bool,
-                 first_followup: bool = False):
+                 first_followup: bool = False, auto_delete_after: int | None = None):
         self.interaction = interaction
         self.author = interaction.user
         self.guild = interaction.guild
@@ -77,6 +81,7 @@ class PanelContext:
         self.bot = interaction.client
         self.private = private
         self.first_followup = first_followup
+        self.auto_delete_after = auto_delete_after
         self.replied = False
         self.board_created = False
         self.message = _SourceMessage(self, interaction.id)
@@ -90,6 +95,8 @@ class PanelContext:
             return await self.interaction.followup.send(
                 *args, ephemeral=True, wait=True, **kwargs,
             )
+        if self.auto_delete_after is not None:
+            kwargs["delete_after"] = self.auto_delete_after
         if self.first_followup and not self.replied:
             self.replied = True
             result = await self.interaction.followup.send(
@@ -353,12 +360,12 @@ class SimplePanelButton(discord.ui.Button):
         if cog is None:
             await interaction.followup.send("Función no disponible.", ephemeral=True)
             return
-        ctx = PanelContext(interaction, private=self.mode != "trabajar")
+        ctx = PanelContext(
+            interaction,
+            private=self.mode not in {"trabajar", "top"},
+            auto_delete_after=15 if self.mode == "top" else None,
+        )
         try:
-            if self.mode == "trabajar":
-                await interaction.followup.send(
-                    "Abriendo tu jornada en este canal…", ephemeral=True,
-                )
             command = getattr(cog, command_name)
             if isinstance(command, commands.Command):
                 await command.callback(cog, ctx)
@@ -403,10 +410,15 @@ class SimplePanel(discord.ui.LayoutView):
         self.kind = kind
         container = discord.ui.Container(accent_color=0x7B42D6)
         if kind == "trabajar":
-            container.add_item(discord.ui.TextDisplay(
-                "## 💼 Centro laboral\nEl tablero de la jornada se abrirá en el canal. "
-                "Para aplicar: Limpiador, Ingeniero o Plomero. "
-                "Los empleos de maestría se gestionan desde Oficina."
+            container.add_item(discord.ui.Section(
+                discord.ui.TextDisplay(
+                    "## 💼 Centro laboral\nEl tablero de la jornada se abrirá en el canal. "
+                    "Para aplicar: Limpiador, Ingeniero o Plomero. "
+                    "Los empleos de maestría se gestionan desde Oficina."
+                ),
+                accessory=discord.ui.Thumbnail(
+                    EMPLEOS_THUMBNAIL, description="Empleos PurpleJack",
+                ),
             ))
             buttons = (("Trabajar", "🛠️", "trabajar"),
                        ("Aplicar", "📋", "aplicar"),

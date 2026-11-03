@@ -14,7 +14,7 @@ os.environ.setdefault("PURPLESLASH_GUILD_ID", "980073134411644939")
 
 from modules.player_panels import (
     GamePanel, PanelContext, SimplePanel, RouletteNumber, _delete_panel_after,
-    JUGAR_THUMBNAIL, CONSULTAR_THUMBNAIL,
+    JUGAR_THUMBNAIL, CONSULTAR_THUMBNAIL, EMPLEOS_THUMBNAIL,
 )
 
 
@@ -76,6 +76,9 @@ class PanelTests(unittest.IsolatedAsyncioTestCase):
 
     def test_employment_panel_includes_all_employment_views(self):
         panel = SimplePanel(1, "trabajar")
+        header = panel.to_components()[0]["components"][0]
+        self.assertEqual(header["type"], 9)
+        self.assertEqual(header["accessory"]["media"]["url"], EMPLEOS_THUMBNAIL)
         rows = [child for child in panel.children[0].children
                 if child.__class__.__name__ == "ActionRow"]
         self.assertEqual(
@@ -147,8 +150,10 @@ class PanelTests(unittest.IsolatedAsyncioTestCase):
             followup=SimpleNamespace(send=AsyncMock(return_value=message)),
         )
         with patch("core.game_reminders.reminder_enabled",
-                   new=AsyncMock(return_value=False)):
+                   new=AsyncMock(return_value=False)), \
+             patch("core.game_reminders.asyncio.sleep", new=AsyncMock()) as sleep:
             await send_game_reminder_prompt(interaction, 42, "dados", 9999999999)
+        sleep.assert_awaited_once_with(2)
         kwargs = interaction.followup.send.await_args.kwargs
         self.assertTrue(kwargs["ephemeral"])
         self.assertTrue(kwargs["wait"])
@@ -202,6 +207,35 @@ class PanelTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(await context.send("two"), "second")
         interaction.followup.send.assert_awaited_once()
         interaction.channel.send.assert_awaited_once()
+
+    async def test_top_context_is_public_and_deleted_after_fifteen_seconds(self):
+        interaction = SimpleNamespace(
+            id=789, user=SimpleNamespace(id=1), guild=object(), client=object(),
+            channel=SimpleNamespace(send=AsyncMock(return_value="top")),
+            followup=SimpleNamespace(send=AsyncMock()),
+        )
+        context = PanelContext(interaction, private=False, auto_delete_after=15)
+        self.assertEqual(await context.send(embed=object(), delete_after=60), "top")
+        self.assertEqual(interaction.channel.send.await_args.kwargs["delete_after"], 15)
+        interaction.followup.send.assert_not_awaited()
+
+    async def test_work_reminder_uses_settled_cooldown(self):
+        from modules.Empleos import _ofrecer_recordatorio_trabajo
+        from core.game_reminders import _current_cooldown_expiry, ReminderPrompt
+
+        author = SimpleNamespace(id=42, roles=[])
+        interaction = object()
+        with patch("modules.Empleos.send_game_reminder_prompt", new=AsyncMock()) as send:
+            _ofrecer_recordatorio_trabajo(
+                interaction, author, {"cooldown_expires_at": 9999999999},
+            )
+            await asyncio.sleep(0)
+        send.assert_awaited_once_with(interaction, 42, "trabajar", 9999999999)
+        self.assertIn("volver a trabajar", str(ReminderPrompt(42, "trabajar", 9999999999).to_components()))
+        with patch("modules.Empleos.get_empleo_user", new=AsyncMock(return_value={
+            "empleo_actual": "piromano", "ultimo_trabajo": 100,
+        })):
+            self.assertEqual(await _current_cooldown_expiry(42, "trabajar"), 10900)
 
     def test_standalone_commands_and_message_context_registered(self):
         from modules.player_commands import PlayerCommands, robar_mensaje

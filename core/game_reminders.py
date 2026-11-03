@@ -14,6 +14,7 @@ GAME_NAMES = {
     "dados": "Dados",
     "bj": "Blackjack",
     "memo": "Memoria",
+    "trabajar": "Trabajar",
 }
 
 
@@ -28,9 +29,13 @@ class ReminderPrompt(discord.ui.LayoutView):
         self.message: discord.Message | None = None
         self._deletion_task: asyncio.Task | None = None
         container = discord.ui.Container(accent_color=0x7B42D6)
+        activity = (
+            "volver a trabajar" if game == "trabajar"
+            else f"jugar **{GAME_NAMES[game]}**"
+        )
         container.add_item(discord.ui.TextDisplay(
-            f"¿Quieres recibir un aviso por DM cuando "
-            f"**{GAME_NAMES[game]}** esté disponible <t:{int(expires_at)}:R>?"
+            f"¿Quieres recibir un aviso por DM cuando puedas "
+            f"{activity} <t:{int(expires_at)}:R>?"
         ))
         row = discord.ui.ActionRow()
         row.add_item(ReminderAcceptButton())
@@ -61,11 +66,7 @@ class ReminderAcceptButton(discord.ui.Button):
             return
         await interaction.response.defer()
         try:
-            current_expiry = (
-                await database.get_command_cooldown("user", prompt.user_id, "memo")
-                if prompt.game == "memo"
-                else await database.get_game_cooldown(prompt.user_id, prompt.game)
-            )
+            current_expiry = await _current_cooldown_expiry(prompt.user_id, prompt.game)
             if current_expiry != prompt.expires_at or current_expiry <= time.time():
                 await interaction.followup.send(
                     "El cooldown de esta partida ya cambió o terminó.", ephemeral=True,
@@ -83,9 +84,13 @@ class ReminderAcceptButton(discord.ui.Button):
             prompt._deletion_task.cancel()
         prompt.clear_items()
         container = discord.ui.Container(accent_color=0x43B581)
+        activity = (
+            "volver a trabajar" if prompt.game == "trabajar"
+            else f"jugar **{GAME_NAMES[prompt.game]}**"
+        )
         container.add_item(discord.ui.TextDisplay(
-            f"✅ <@{prompt.user_id}> Te avisaré por DM cuando "
-            f"**{GAME_NAMES[prompt.game]}** esté disponible."
+            f"✅ <@{prompt.user_id}> Te avisaré por DM cuando puedas "
+            f"{activity}."
         ))
         prompt.add_item(container)
         try:
@@ -101,11 +106,15 @@ class ReminderAcceptButton(discord.ui.Button):
 
 async def send_game_reminder_prompt(interaction: discord.Interaction | None,
                                     user_id: int, game: str,
-                                    expires_at: float) -> None:
+                                    expires_at: float, *, delay: float = 2) -> None:
     """No afecta la liquidación del juego si Discord o el aviso fallan."""
     if interaction is None or expires_at <= time.time():
         return
     try:
+        if delay:
+            await asyncio.sleep(delay)
+        if expires_at <= time.time():
+            return
         if await reminder_enabled(user_id, game, expires_at):
             return
         prompt = ReminderPrompt(user_id, game, expires_at)
@@ -117,6 +126,27 @@ async def send_game_reminder_prompt(interaction: discord.Interaction | None,
         prompt._deletion_task = asyncio.create_task(_delete_prompt_after(prompt, 15))
     except Exception:
         logger.exception("No se pudo ofrecer aviso de %s a %s", game, user_id)
+
+
+async def _work_cooldown_expiry(user_id: int) -> float:
+    from modules.Empleos import EMPLEOS, EMPLEOS_MAESTRIA, get_empleo_user, normalizar_empleo
+
+    data = await get_empleo_user(user_id, force_refresh=True)
+    if not data:
+        return 0
+    empleo = normalizar_empleo(data.get("empleo_actual") or "")
+    info = EMPLEOS.get(empleo) or EMPLEOS_MAESTRIA.get(empleo)
+    if not info:
+        return 0
+    return float(data.get("ultimo_trabajo") or 0) + info["duracion_horas"] * 3600
+
+
+async def _current_cooldown_expiry(user_id: int, game: str) -> float:
+    if game == "memo":
+        return await database.get_command_cooldown("user", user_id, "memo")
+    if game == "trabajar":
+        return await _work_cooldown_expiry(user_id)
+    return await database.get_game_cooldown(user_id, game)
 
 
 async def init_game_reminders() -> None:
@@ -187,11 +217,7 @@ async def game_reminder_worker(bot: discord.Client) -> None:
                 user_id, game, expires_at = (
                     reminder["user_id"], reminder["game"], reminder["expires_at"]
                 )
-                current_expiry = (
-                    await database.get_command_cooldown("user", user_id, "memo")
-                    if game == "memo"
-                    else await database.get_game_cooldown(user_id, game)
-                )
+                current_expiry = await _current_cooldown_expiry(user_id, game)
                 if current_expiry != expires_at:
                     async with database.pool.acquire() as conn:
                         if current_expiry > time.time():
@@ -208,12 +234,19 @@ async def game_reminder_worker(bot: discord.Client) -> None:
                                 user_id, game, expires_at,
                             )
                     continue
+                if game == "trabajar":
+                    from modules.Empleos import get_jornada_activa
+                    if await get_jornada_activa(user_id):
+                        continue  # La jornada en curso se comprobará al caducar el lease.
                 try:
                     user = await bot.fetch_user(user_id)
-                    await user.send(
-                        f"🔔 Ya puedes volver a jugar **{GAME_NAMES[game]}** "
-                        "en PurpleSlash."
-                    )
+                    if game == "trabajar":
+                        await user.send("🔔 Ya puedes volver a trabajar en PurpleSlash.")
+                    else:
+                        await user.send(
+                            f"🔔 Ya puedes volver a jugar **{GAME_NAMES[game]}** "
+                            "en PurpleSlash."
+                        )
                     result = time.time()
                 except (discord.Forbidden, discord.NotFound):
                     result = -1  # DM cerrados: no insistir ni generar spam.

@@ -16,6 +16,7 @@ from core.database import (
     pool, _get_economy_lock, _flush_user_to_db_unlocked, get_system_toggle,
 )
 from core import cache as economy_cache
+from core.game_reminders import send_game_reminder_prompt
 
 logger = logging.getLogger("purplejack.empleos")
 
@@ -141,6 +142,16 @@ def _es_coordinador(member: discord.Member) -> bool:
         r.id == COORDINADOR_ROLE_ID or r.name == STAFF_BYPASS_ROL
         for r in member.roles
     )
+
+
+def _ofrecer_recordatorio_trabajo(interaction, author, settlement: dict) -> None:
+    """Ofrece el aviso tras liquidar y mostrar el resultado de una jornada."""
+    expires_at = settlement.get("cooldown_expires_at")
+    if interaction is None or not expires_at or _es_coordinador(author):
+        return
+    asyncio.create_task(send_game_reminder_prompt(
+        interaction, author.id, "trabajar", expires_at,
+    ))
 
 
 def _puede_acceder_oficina(data: dict | None, member: discord.Member) -> bool:
@@ -972,7 +983,12 @@ async def _finalizar_jornada_atomica_unlocked(
             data["historial_reciente_de_jornadas"]
         )
         _EMPLEOS_CACHE[user_id] = data
-    return {"ok": True, "bonus": bonus}
+    info = EMPLEOS.get(normalizar_empleo(empleo)) or EMPLEOS_MAESTRIA.get(normalizar_empleo(empleo))
+    return {
+        "ok": True,
+        "bonus": bonus,
+        "cooldown_expires_at": now + info["duracion_horas"] * 3600 if info else 0,
+    }
 
 
 async def finalizar_jornada_atomica(
@@ -2324,6 +2340,7 @@ class CazadorView(JornadaView):
                 )
             elif self.message is not None:
                 await self.message.edit(embed=embed, view=self)
+            _ofrecer_recordatorio_trabajo(interaction, self.author, settlement)
         except Exception as error:
             _log_trabajar_error("Cazador", error, self.author.name, "_finalizar")
             await _cerrar_tablero_con_error(
@@ -2653,6 +2670,7 @@ class PiromanoView(JornadaView):
                 self,
                 embed=self.build_embed(),
             )
+            _ofrecer_recordatorio_trabajo(interaction, self.author, settlement)
         except Exception as error:
             _log_trabajar_error("Píromano", error, self.author.name, "_finalizar")
             await _cerrar_tablero_con_error(
@@ -2910,6 +2928,7 @@ class ChantajistaView(JornadaView):
                 )
             elif self.message is not None:
                 await self.message.edit(embed=embed, view=None)
+            _ofrecer_recordatorio_trabajo(interaction, self.author, settlement)
         except Exception as error:
             _log_trabajar_error("Chantajista", error, self.author.name, "_finalizar")
             await _cerrar_tablero_con_error(
@@ -3097,6 +3116,7 @@ class LimpiadorView(JornadaView):
                     )
                 elif self.message is not None:
                     await self.message.edit(embed=result_embed, view=None)
+                _ofrecer_recordatorio_trabajo(interaction, self.author, settlement)
                 _programar_eliminacion(self)
                 return
             mensaje = random.choice(self.info['mensajes_exito']).format(monto=pago, COIN=COIN)
@@ -3121,6 +3141,7 @@ class LimpiadorView(JornadaView):
                 )
             elif self.message is not None:
                 await self.message.edit(embed=result_embed, view=None)
+            _ofrecer_recordatorio_trabajo(interaction, self.author, settlement)
             _programar_eliminacion(self)
         except Exception as e:
             _log_trabajar_error("Limpiador", e, self.author.name, "_terminar")
@@ -3364,6 +3385,7 @@ class IngenieroView(JornadaView):
                 )
             elif self.message is not None:
                 await self.message.edit(embed=result_embed, view=None)
+            _ofrecer_recordatorio_trabajo(interaction, self.author, settlement)
             _programar_eliminacion(self)
         except Exception as e:
             _log_trabajar_error("Ingeniero", e, self.author.name, "_terminar")
@@ -3549,6 +3571,7 @@ class PlomeroView(JornadaView):
                 )
             elif self.message is not None:
                 await self.message.edit(embed=result_embed, view=None)
+            _ofrecer_recordatorio_trabajo(interaction, self.author, settlement)
             _programar_eliminacion(self)
         except Exception as e:
             _log_trabajar_error("Plomero", e, self.author.name, "_terminar")
