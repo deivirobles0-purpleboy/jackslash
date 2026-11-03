@@ -103,6 +103,75 @@ class PanelTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("modules.adivinar", source)
         self.assertIn("intents.message_content = False", source)
 
+    async def test_slash_migration_verifies_guild_before_global_cleanup(self):
+        import bot as bot_module
+
+        events = []
+        local = [SimpleNamespace(name=name)
+                 for name in bot_module._REQUIRED_PLAYER_COMMANDS]
+        old_global = [SimpleNamespace(name="comando_viejo")]
+
+        async def sync(*, guild=None):
+            events.append("sync_guild" if guild else "sync_global")
+            return []
+
+        async def fetch_commands(*, guild=None):
+            events.append("fetch_guild" if guild else "fetch_global")
+            if guild:
+                return local
+            return old_global if events.count("fetch_global") == 1 else []
+
+        def clear_commands(*, guild=None):
+            events.append("clear_global")
+
+        tree = SimpleNamespace(
+            get_commands=lambda: local,
+            copy_global_to=lambda **kwargs: events.append("copy_to_guild"),
+            sync=sync,
+            fetch_commands=fetch_commands,
+            clear_commands=clear_commands,
+        )
+        client = SimpleNamespace(
+            tree=tree, user="TestBot", guilds=[SimpleNamespace(id=int(bot_module.GUILD_ID))],
+            get_guild=lambda guild_id: object(),
+        )
+        await bot_module.sync_slash_commands(client)
+        self.assertLess(events.index("sync_guild"), events.index("clear_global"))
+        self.assertLess(events.index("fetch_guild"), events.index("clear_global"))
+        self.assertLess(events.index("clear_global"), events.index("sync_global"))
+
+    async def test_slash_migration_rejects_wrong_guild_without_deleting(self):
+        import bot as bot_module
+        tree = SimpleNamespace(clear_commands=unittest.mock.Mock(), sync=AsyncMock())
+        client = SimpleNamespace(
+            tree=tree, user="TestBot", guilds=[], get_guild=lambda guild_id: None,
+        )
+        with self.assertRaisesRegex(RuntimeError, "no es un servidor conectado"):
+            await bot_module.sync_slash_commands(client)
+        tree.clear_commands.assert_not_called()
+        tree.sync.assert_not_awaited()
+
+    async def test_slash_migration_keeps_globals_if_guild_is_incomplete(self):
+        import bot as bot_module
+        local = [SimpleNamespace(name=name)
+                 for name in bot_module._REQUIRED_PLAYER_COMMANDS]
+        tree = SimpleNamespace(
+            get_commands=lambda: local,
+            copy_global_to=unittest.mock.Mock(),
+            sync=AsyncMock(),
+            fetch_commands=AsyncMock(return_value=local[:-1]),
+            clear_commands=unittest.mock.Mock(),
+        )
+        client = SimpleNamespace(
+            tree=tree, user="TestBot",
+            guilds=[SimpleNamespace(id=int(bot_module.GUILD_ID))],
+            get_guild=lambda guild_id: object(),
+        )
+        with self.assertRaisesRegex(RuntimeError, "no registró todos"):
+            await bot_module.sync_slash_commands(client)
+        tree.clear_commands.assert_not_called()
+        self.assertEqual(tree.sync.await_count, 1)
+
     def test_help_lists_only_available_slash_entry_points(self):
         from modules.economy import (
             NAVE_COMMAND_PAGES, NAVE_INFO_DESCRIPTION,

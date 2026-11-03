@@ -194,6 +194,7 @@ wager_recovery_task = None
 inactive_purge_task = None
 log_cleanup_task = None
 game_reminder_task = None
+slash_sync_done = False
 _activity_writes = {}
 bot._user_activity_writes = _activity_writes
 
@@ -691,10 +692,71 @@ async def shutdown():
     logger.info("Caché flusheada correctamente.")
     await bot.close()
 
+_REQUIRED_PLAYER_COMMANDS = {
+    "jugar", "consultar", "trabajar", "work", "crime", "collect",
+    "tienda", "rob", "Robar", "carrera", "retar",
+}
+
+
+async def sync_slash_commands(client: commands.Bot) -> None:
+    """Publica primero los comandos del servidor; luego limpia globales heredados."""
+    guild_id = int(GUILD_ID)
+    if client.get_guild(guild_id) is None:
+        raise RuntimeError(
+            f"PURPLESLASH_GUILD_ID={guild_id} no es un servidor conectado a "
+            f"{client.user}. Servidores visibles: {[guild.id for guild in client.guilds]}"
+        )
+
+    guild = discord.Object(id=guild_id)
+    local_global = client.tree.get_commands()
+    local_names = {command.name for command in local_global}
+    missing = _REQUIRED_PLAYER_COMMANDS - local_names
+    if missing:
+        raise RuntimeError(f"Faltan comandos locales antes de sincronizar: {sorted(missing)}")
+
+    client.tree.copy_global_to(guild=guild)
+    await client.tree.sync(guild=guild)
+    published = await client.tree.fetch_commands(guild=guild)
+    published_names = {command.name for command in published}
+    missing_remote = local_names - published_names
+    if missing_remote or len(published) != len(local_global):
+        raise RuntimeError(
+            f"Discord no registró todos los comandos en el servidor {guild_id}. "
+            f"Esperados: {len(local_global)}, publicados: {len(published)}, "
+            f"faltantes: {sorted(missing_remote)}"
+        )
+    logger.info(
+        "[SLASH] Servidor %s: %s comandos verificados; paneles /jugar, "
+        "/consultar y /trabajar presentes.", guild_id, len(published),
+    )
+
+    # Los comandos globales del repositorio anterior son independientes de los
+    # del servidor. Solo se retiran tras verificar que los nuevos están activos.
+    old_global = await client.tree.fetch_commands()
+    client.tree.clear_commands(guild=None)
+    if old_global:
+        try:
+            await client.tree.sync()
+            remaining = await client.tree.fetch_commands()
+            if remaining:
+                raise RuntimeError(
+                    f"Persisten {len(remaining)} comandos globales antiguos en Discord."
+                )
+        except Exception:
+            for command in local_global:
+                client.tree.add_command(command)
+            raise
+    logger.info(
+        "[SLASH] Comandos globales anteriores retirados: %s. "
+        "Comandos de PurpleSlash activos solo en servidor %s.",
+        len(old_global), guild_id,
+    )
+
+
 @bot.event
 async def on_ready():
     global evento_flush_task, cargos_task, wager_recovery_task
-    global inactive_purge_task, log_cleanup_task, game_reminder_task
+    global inactive_purge_task, log_cleanup_task, game_reminder_task, slash_sync_done
     logger.info(f"Bot conectado como {bot.user}")
     logger.info(
         "Caché iniciada | Flush cada %s segundos",
@@ -702,17 +764,17 @@ async def on_ready():
     )
     logger.info(f"Servidores activos: {len(bot.guilds)}")
 
-    try:
-        if GUILD_ID:
-            guild = discord.Object(id=int(GUILD_ID))
-            bot.tree.copy_global_to(guild=guild)
-            synced = await bot.tree.sync(guild=guild)
-            logger.info(f"Comandos Slash/Staff sincronizados en el servidor {GUILD_ID}: {len(synced)} comandos.")
-        else:
-            synced = await bot.tree.sync()
-            logger.info(f"Comandos Slash/Staff sincronizados globalmente: {len(synced)} comandos.")
-    except Exception as e:
-        logger.warning(f"Error sincronizando comandos slash: {e}")
+    if not slash_sync_done:
+        try:
+            await sync_slash_commands(bot)
+            slash_sync_done = True
+        except Exception:
+            logger.exception(
+                "[SLASH:E_SYNC] No se pudo verificar la publicación de comandos. "
+                "Revisa el token, PURPLESLASH_GUILD_ID y los permisos de la aplicación."
+            )
+            await bot.close()
+            return
 
     asyncio.create_task(cache.flush_loop())
     if not TEST_MODE and (cargos_task is None or cargos_task.done()):
