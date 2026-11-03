@@ -204,6 +204,21 @@ class PanelTests(unittest.IsolatedAsyncioTestCase):
             self.assertFalse(bot_module._register_shutdown_signal(unsupported))
         self.assertIn("[STARTUP:SIGNAL]", captured.output[0])
 
+    def test_squarecloud_runs_bot_entrypoint_directly(self):
+        root = Path(__file__).resolve().parents[1]
+        config = (root / "squarecloud.app").read_text(encoding="utf-8")
+        self.assertIn("MAIN=bot.py", config.splitlines())
+        source = (root / "bot.py").read_text(encoding="utf-8")
+        tree = ast.parse(source)
+        self.assertTrue(any(
+            isinstance(node, ast.If)
+            and any(isinstance(child, ast.Call)
+                    and isinstance(child.func, ast.Name)
+                    and child.func.id == "run_bot"
+                    for child in ast.walk(node))
+            for node in tree.body
+        ))
+
     def test_help_lists_only_available_slash_entry_points(self):
         from modules.economy import (
             NAVE_COMMAND_PAGES, NAVE_INFO_DESCRIPTION,

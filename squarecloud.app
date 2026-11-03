@@ -1,5 +1,5 @@
 DISPLAY_NAME=PurpleSlash
-MAIN=main.py
+MAIN=bot.py
 MEMORY=256
 VERSION=recommended
 AUTORESTART=true

@@ -950,3 +950,8 @@ def run_bot():
             logger.info("Flush final completado al cerrar.")
 
     asyncio.run(main())
+
+
+if __name__ == "__main__":
+    logger.info("[STARTUP:ENTRY] bot.py inició run_bot directamente.")
+    run_bot()
