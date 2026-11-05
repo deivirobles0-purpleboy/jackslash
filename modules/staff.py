@@ -22,21 +22,18 @@ from core.database import (
     save_game_config, save_ruleta_config,
     save_rob_config, save_dados_config, save_memo_config, save_blackjack_config,
     clear_game_cooldowns,
-    activar_evento as activar_evento_db, cerrar_evento as cerrar_evento_db,
-    flush_evento_puntos, set_duel_cooldown_config, get_duel_active_config,
+    set_duel_cooldown_config, get_duel_active_config,
     set_duel_active_config, clear_command_cooldowns, set_system_toggle,
     add_cargo_temporal, delete_cargo_temporal, get_cargo_temporal,
 )
 from core import cache
 from core.halloween import (
     CANDY,
-    add_candy_balance,
     add_craft_item,
     delete_craft_item,
     get_candy_ranking_page,
     get_craft_items,
 )
-from core.member_resolution import resolve_guild_member
 from core.config import (
     ruleta_config, game_config, dados_config, memo_config,
     blackjack_config, COIN,
@@ -48,8 +45,6 @@ from modules.Empleos import (
     get_all_experiencia_laboral,
 )
 
-EVENTO_THUMBNAIL_URL = "https://pub-a09b3609b6b34dfab5c7aa7742cd1a8a.r2.dev/Purple%20jack%20Harcode/PurpleThumb.png"
-EVENTO_TOP_ICON = "<:ygoldstar:1004555717610590258>"
 
 
 def is_staff():
@@ -92,9 +87,6 @@ class ResetAllModal(discord.ui.Modal, title="Confirmar Reset Global"):
         cache._cache.clear()
         cache._dirty.clear()
         cache.reset_balance_index(0)
-        if cache.is_evento_activo():
-            cache.clear_evento_puntos()
-            await flush_evento_puntos()
         await interaction.response.send_message("✅ Reset global completado.", ephemeral=False)
 
 # ── RESET DE EXPERIENCIA LABORAL ────────────────────────
@@ -353,8 +345,7 @@ class ExperienciaLaboralPaginationView(discord.ui.View):
             lines = ["Pos | Usuario               | Empleo       | EXP"]
             lines.append("----+-----------------------+--------------+-----")
             for position, row in enumerate(page_rows, start=start + 1):
-                member = await resolve_guild_member(self.guild, row["user_id"])
-                nick = member.nick or member.display_name if member else f"ID {row['user_id']}"
+                nick = cache.get_member_name(row["user_id"]) or f"ID {row['user_id']}"
                 nick = nick.replace("`", "'")[:20]
                 empleo = (row.get("empleo_actual") or "Sin empleo").title().replace("`", "'")[:12]
                 lines.append(f"{position:>3} | {nick:<21} | {empleo:<12} | {row.get('exp_laboral', 0):>3}")
@@ -502,8 +493,6 @@ class EconomiaView(discord.ui.View):
             return await interaction.response.send_message("❌ Solo el creador puede usar estos botones.", ephemeral=True)
 
         await interaction.response.defer()
-        await asyncio.sleep(10)
-
         rows = await get_all_inventarios()
         wb = Workbook()
         ws = wb.active
@@ -517,24 +506,7 @@ class EconomiaView(discord.ui.View):
         for row in rows:
             user_id = row["user_id"]
             if user_id not in user_names:
-                member = None
-                if interaction.guild:
-                    member = interaction.guild.get_member(user_id)
-                    if member is None:
-                        try:
-                            member = await interaction.guild.fetch_member(user_id)
-                        except Exception:
-                            member = None
-                if member:
-                    user_names[user_id] = member.nick or member.name
-                else:
-                    user_obj = interaction.client.get_user(user_id)
-                    if not user_obj:
-                        try:
-                            user_obj = await interaction.client.fetch_user(user_id)
-                        except Exception:
-                            user_obj = None
-                    user_names[user_id] = user_obj.name if user_obj else f"Usuario {user_id}"
+                user_names[user_id] = cache.get_member_name(user_id) or f"ID {user_id}"
 
             if current_user != user_id:
                 current_user = user_id
@@ -594,7 +566,7 @@ class Staff(commands.Cog):
 
     @app_commands.command(
         name="punish",
-        description="Restringe temporalmente los comandos con prefijo de un usuario",
+        description="Restringe temporalmente comandos e interacciones de un usuario",
     )
     @app_commands.rename(usuario="user", tiempo="time")
     @app_commands.describe(
@@ -635,31 +607,20 @@ class Staff(commands.Cog):
 
         await interaction.response.defer(ephemeral=False)
         now = time.time()
-        previous = await get_cargo_temporal(usuario.id, interaction.guild.id, role.id)
-        previous_active = bool(previous and previous["expira_en"] > now)
-        expires_at = await add_cargo_temporal(
-            usuario.id,
-            interaction.guild.id,
-            role.id,
-            now + duration,
-        )
-
         role_was_present = role in usuario.roles
         try:
             if not role_was_present:
                 await usuario.add_roles(
                     role,
                     reason=(
-                        f"Restricción temporal de comandos aplicada por {interaction.user} "
-                        f"hasta {int(expires_at)}"
+                        f"Restricción temporal de interacciones aplicada por {interaction.user} "
+                        f"durante {tiempo}"
                     ),
                 )
             verified_member = await interaction.guild.fetch_member(usuario.id)
             if role.id not in {member_role.id for member_role in verified_member.roles}:
                 raise RuntimeError("Discord no confirmó la asignación del rol")
         except (discord.Forbidden, discord.HTTPException, RuntimeError) as error:
-            if not previous_active:
-                await delete_cargo_temporal(usuario.id, role.id, interaction.guild.id)
             logger.warning(
                 "No se pudo aplicar la restricción a %s: %s",
                 usuario.id,
@@ -668,6 +629,22 @@ class Staff(commands.Cog):
             return await interaction.followup.send(
                 "❌ No pude asignar o verificar el rol de Expulsado. La restricción no fue aplicada. "
                 "Revisa los permisos y la jerarquía del rol del bot.",
+                ephemeral=True,
+            )
+
+        try:
+            expires_at = await add_cargo_temporal(
+                usuario.id, interaction.guild.id, role.id, now + duration,
+            )
+        except Exception:
+            logger.exception("No se pudo persistir /punish para %s", usuario.id)
+            if not role_was_present:
+                try:
+                    await usuario.remove_roles(role, reason="Fallo al persistir /punish")
+                except discord.HTTPException:
+                    logger.exception("No se pudo revertir el rol Expulsado de %s", usuario.id)
+            return await interaction.followup.send(
+                "❌ No pude guardar la restricción. Comprueba la base de datos y el rol antes de reintentar.",
                 ephemeral=True,
             )
 
@@ -710,31 +687,6 @@ class Staff(commands.Cog):
                 ephemeral=True,
             )
 
-    @app_commands.command(name="add_candy", description="Añade dulces al saldo de un miembro")
-    @app_commands.describe(usuario="Miembro que recibirá los dulces", cantidad="Dulces a añadir")
-    @is_staff()
-    async def add_candy(self, interaction: discord.Interaction,
-                        usuario: discord.Member, cantidad: int):
-        if not 0 < cantidad <= 2_147_483_647:
-            return await interaction.response.send_message(
-                "❌ La cantidad debe estar entre 1 y 2.147.483.647.", ephemeral=True,
-            )
-        await interaction.response.defer(ephemeral=True)
-        try:
-            balance = await add_candy_balance(usuario.id, cantidad)
-        except Exception:
-            logger.exception("No se pudieron acreditar dulces a %s", usuario.id)
-            return await interaction.followup.send(
-                "❌ No pude acreditar los dulces. Comprueba el saldo e inténtalo de nuevo.",
-                ephemeral=True,
-            )
-        await interaction.followup.send(
-            f"✅ Se añadieron **{cantidad:,}** {CANDY} a **{usuario.display_name}**. "
-            f"Saldo actual: **{balance:,}** {CANDY}.",
-            ephemeral=True,
-            allowed_mentions=discord.AllowedMentions.none(),
-        )
-
     @app_commands.command(name="addcoins", description="Añade PurpleCoins a un miembro")
     @app_commands.describe(usuario="Miembro", cantidad="Cantidad a añadir", destino="Balance o Banco")
     @app_commands.choices(destino=[
@@ -772,64 +724,6 @@ class Staff(commands.Cog):
         await interaction.followup.send(
             f"✅ Se removieron **{cantidad}** {COIN} del **{destino.name}** de {usuario.mention}.", ephemeral=False
         )
-
-    @app_commands.command(name="activar_evento", description="Inicia el ranking de Purple Coins del evento")
-    @is_staff()
-    async def activar_evento(self, interaction: discord.Interaction):
-        if cache.is_evento_activo():
-            return await interaction.response.send_message(
-                "❌ Ya hay un evento de Purple Coins activo.", ephemeral=True
-            )
-
-        await interaction.response.defer(ephemeral=True)
-        await activar_evento_db()
-        await interaction.followup.send(
-            "✅ Evento activado. Desde ahora se registran los cambios de balance para el ranking del evento.",
-            ephemeral=True,
-        )
-
-    @app_commands.command(name="cerrar_evento", description="Cierra el evento y publica sus resultados")
-    @app_commands.describe(canal_resultados="Canal donde se publicará el Top 10 final")
-    @is_staff()
-    async def cerrar_evento(self, interaction: discord.Interaction, canal_resultados: discord.TextChannel):
-        if not cache.is_evento_activo():
-            return await interaction.response.send_message(
-                "❌ No hay un evento de Purple Coins activo.", ephemeral=True
-            )
-
-        await interaction.response.defer(ephemeral=True)
-        try:
-            await cerrar_evento_db()
-            await flush_evento_puntos()
-            await cache.flush_to_db()
-
-            resultados = cache.get_evento_top(10)
-            if resultados:
-                lineas = []
-                for indice, (user_id, puntos) in enumerate(resultados):
-                    posicion = EVENTO_TOP_ICON if indice < 4 else f"**{indice + 1}.**"
-                    lineas.append(f"{posicion} <@{user_id}> —— {COIN} **{puntos}**")
-                descripcion = "\n".join(lineas)
-            else:
-                descripcion = "No se registraron ingresos durante el evento."
-
-            embed = discord.Embed(
-                title="TOP PURPLE COINS",
-                description=descripcion,
-                color=discord.Color.blue(),
-            )
-            embed.set_footer(text="Retiros del banco y collects no suman puntos.")
-            embed.set_thumbnail(url=EVENTO_THUMBNAIL_URL)
-            await canal_resultados.send(embed=embed)
-            await interaction.followup.send(
-                f"✅ Evento cerrado y resultados publicados en {canal_resultados.mention}.",
-                ephemeral=True,
-            )
-        except Exception:
-            logger.exception("Error cerrando el evento de Purple Coins")
-            await interaction.followup.send(
-                "❌ No se pudieron publicar los resultados del evento.", ephemeral=True
-            )
 
     @app_commands.command(name="add_xp_laboral", description="Otorga XP Laboral a un usuario de empleos")
     @app_commands.describe(usuario="Usuario al que asignar XP", xp="Cantidad de XP a otorgar")

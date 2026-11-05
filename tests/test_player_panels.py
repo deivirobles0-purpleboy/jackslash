@@ -44,10 +44,8 @@ class PanelTests(unittest.IsolatedAsyncioTestCase):
     async def test_panel_autodelete_closes_menu_without_ending_game(self):
         panel = GamePanel(1, 100, None)
         panel.active.add("memo")
-        panel._poll_task = asyncio.create_task(asyncio.Event().wait())
         message = SimpleNamespace(delete=AsyncMock())
         await _delete_panel_after(panel, message, 0)
-        await asyncio.gather(panel._poll_task, return_exceptions=True)
         self.assertTrue(panel.expired)
         self.assertTrue(panel.is_finished())
         self.assertEqual(panel.active, {"memo"})
@@ -59,6 +57,32 @@ class PanelTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(consult.is_finished())
         consult_message.delete.assert_awaited_once()
 
+        work = SimplePanel(1, "trabajar")
+        work_message = SimpleNamespace(delete=AsyncMock())
+        await _delete_panel_after(work, work_message, 0)
+        self.assertTrue(work.is_finished())
+        work_message.delete.assert_awaited_once()
+
+    async def test_work_panel_schedules_private_deletion_at_sixty_seconds(self):
+        from modules.player_panels import PlayerPanels
+
+        message = SimpleNamespace(delete=AsyncMock())
+        interaction = SimpleNamespace(
+            user=SimpleNamespace(id=42),
+            response=SimpleNamespace(defer=AsyncMock()),
+            followup=SimpleNamespace(send=AsyncMock(return_value=message)),
+        )
+        with patch("modules.player_panels.asyncio.create_task") as schedule:
+            await PlayerPanels.trabajar.callback(PlayerPanels(None), interaction)
+        interaction.response.defer.assert_awaited_once_with(ephemeral=True)
+        kwargs = interaction.followup.send.await_args.kwargs
+        self.assertTrue(kwargs["ephemeral"])
+        self.assertTrue(kwargs["wait"])
+        self.assertEqual(kwargs["view"].kind, "trabajar")
+        scheduled = schedule.call_args.args[0]
+        self.assertEqual(scheduled.cr_frame.f_locals["delay"], 60)
+        scheduled.close()
+
     async def test_cooldown_disables_game_without_panel_bells(self):
         game = GamePanel(1, 100, None)
         with patch("modules.player_panels._cooldown", new=AsyncMock(return_value=9999999999)):
@@ -69,6 +93,43 @@ class PanelTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(all(len(row.children) == 1 for row in rows))
         self.assertTrue(all(row.children[0].disabled for row in rows))
         self.assertFalse(any("🔔" in row.children[0].label for row in rows))
+
+    async def test_finished_game_updates_open_panel_without_polling(self):
+        from modules.player_panels import _open_game_panels, notify_game_finished
+
+        panel = GamePanel(42, 100, None)
+        panel.active.add("dados")
+        panel.message = SimpleNamespace(edit=AsyncMock())
+        _open_game_panels.setdefault(42, set()).add(panel)
+        try:
+            with patch("modules.player_panels._cooldown", new=AsyncMock()) as cooldown:
+                await notify_game_finished(42, "dados", 9999999999)
+            self.assertNotIn("dados", panel.active)
+            self.assertEqual(panel.cooldowns["dados"], 9999999999)
+            panel.message.edit.assert_awaited_once_with(view=panel)
+            cooldown.assert_not_awaited()
+            self.assertFalse(hasattr(panel, "_poll_task"))
+        finally:
+            _open_game_panels[42].discard(panel)
+
+    async def test_tienda_opens_v2_directly(self):
+        from modules.player_commands import PlayerCommands
+        from modules.shop import TiendaLayout
+
+        player = PlayerCommands(None)
+        interaction = SimpleNamespace(
+            user=SimpleNamespace(id=42),
+            response=SimpleNamespace(defer=AsyncMock(), send_message=AsyncMock()),
+            followup=SimpleNamespace(send=AsyncMock()),
+        )
+        items = [{"id": 1, "precio": 200, "nombre": "A", "icono": "🔹", "stock": 1},
+                 {"id": 2, "precio": 100, "nombre": "B", "icono": "🔹", "stock": 1}]
+        with patch("core.database.get_all_items", new=AsyncMock(return_value=items)):
+            await PlayerCommands.tienda.callback(player, interaction)
+        kwargs = interaction.followup.send.await_args.kwargs
+        self.assertIsInstance(kwargs["view"], TiendaLayout)
+        self.assertEqual([item["precio"] for item in kwargs["view"].items], [100, 200])
+        self.assertTrue(kwargs["ephemeral"])
 
     def test_number_modal_range(self):
         modal = RouletteNumber(GamePanel(1, 100, None))
@@ -100,6 +161,29 @@ class PanelTests(unittest.IsolatedAsyncioTestCase):
             [["balance", "inventario"], ["cd", "top"], ["time", "info"]],
         )
         self.assertIn("Panel de consultas Purplejack", str(panel.to_components()))
+
+    async def test_cd_consultation_stays_ephemeral_without_autodelete(self):
+        from modules.economy import Economy
+
+        panel = SimplePanel(42, "consultar")
+        button = next(child for child in panel.walk_children()
+                      if getattr(child, "mode", None) == "cd")
+        economy = Economy(None)
+        interaction = SimpleNamespace(
+            id=123,
+            user=SimpleNamespace(id=42),
+            guild=SimpleNamespace(id=9),
+            client=SimpleNamespace(get_cog=lambda name: economy),
+            channel=SimpleNamespace(send=AsyncMock()),
+            response=SimpleNamespace(defer=AsyncMock()),
+            followup=SimpleNamespace(send=AsyncMock(return_value=object())),
+        )
+        with patch("bot.check_player_access", new=AsyncMock(return_value=True)):
+            await button.callback(interaction)
+        kwargs = interaction.followup.send.await_args.kwargs
+        self.assertTrue(kwargs["ephemeral"])
+        self.assertNotIn("delete_after", kwargs)
+        interaction.channel.send.assert_not_awaited()
 
     def test_game_panel_has_no_redundant_start_notice(self):
         root = Path(__file__).resolve().parents[1]
@@ -329,11 +413,10 @@ class PanelTests(unittest.IsolatedAsyncioTestCase):
             {"balance": 500, "bank": 10}, {"balance": 0, "bank": 510},
         ])), patch("modules.economy.update_bank", new=AsyncMock(return_value=500)) as bank, \
              patch("modules.economy.update_balance", new=AsyncMock()) as balance, \
-             patch("modules.economy.cache.record_evento_balance_delta") as event:
+             patch("modules.economy.cache.mark_dirty"):
             await modal.on_submit(submit)
         balance.assert_awaited_once_with(42, -500, track_event=False)
         bank.assert_awaited_once_with(42, 500, track_event=False)
-        event.assert_called_once()
         submit.response.defer.assert_awaited_once_with(ephemeral=True)
         panel_message.edit.assert_awaited_once()
         click.message.edit.assert_not_awaited()
@@ -412,6 +495,21 @@ class PanelTests(unittest.IsolatedAsyncioTestCase):
         })):
             self.assertEqual(await _current_cooldown_expiry(42, "trabajar"), 10900)
 
+    async def test_work_reminder_is_offered_to_coordinator_too(self):
+        from modules.Empleos import _ofrecer_recordatorio_trabajo
+        from core.config import COORDINADOR_ROLE_ID
+
+        author = SimpleNamespace(id=42, roles=[SimpleNamespace(
+            id=COORDINADOR_ROLE_ID, name="Coordinador-ES",
+        )])
+        interaction = object()
+        with patch("modules.Empleos.send_game_reminder_prompt", new=AsyncMock()) as send:
+            _ofrecer_recordatorio_trabajo(
+                interaction, author, {"cooldown_expires_at": 9999999999},
+            )
+            await asyncio.sleep(0)
+        send.assert_awaited_once_with(interaction, 42, "trabajar", 9999999999)
+
     def test_standalone_commands_and_message_context_registered(self):
         from modules.player_commands import PlayerCommands, robar_mensaje
         from discord import app_commands
@@ -448,11 +546,26 @@ class PanelTests(unittest.IsolatedAsyncioTestCase):
         root = Path(__file__).resolve().parents[1]
         source = (root / "bot.py").read_text(encoding="utf-8")
         tree = ast.parse(source)
-        handler = next(node for node in tree.body
-                       if isinstance(node, ast.AsyncFunctionDef) and node.name == "on_message")
-        self.assertEqual(len(handler.body), 2)
+        self.assertFalse(any(isinstance(node, ast.AsyncFunctionDef) and node.name == "on_message"
+                             for node in tree.body))
         self.assertNotIn("modules.adivinar", source)
         self.assertIn("intents.message_content = False", source)
+
+    def test_no_prefix_commands_or_event_tables_are_registered(self):
+        root = Path(__file__).resolve().parents[1]
+        python_sources = [root / "bot.py", *(root / "modules").glob("*.py")]
+        for path in python_sources:
+            source = path.read_text(encoding="utf-8")
+            self.assertNotIn("@commands.command", source, str(path))
+            self.assertNotIn("@commands.cooldown", source, str(path))
+        database_source = (root / "core" / "database.py").read_text(encoding="utf-8")
+        self.assertNotIn("CREATE TABLE IF NOT EXISTS evento_estado", database_source)
+        self.assertNotIn("CREATE TABLE IF NOT EXISTS evento_puntos", database_source)
+
+    def test_cache_flush_worker_is_guarded_on_reconnect(self):
+        root = Path(__file__).resolve().parents[1]
+        source = (root / "bot.py").read_text(encoding="utf-8")
+        self.assertIn("if cache_flush_task is None or cache_flush_task.done():", source)
 
     async def test_slash_migration_verifies_guild_before_global_cleanup(self):
         import bot as bot_module
@@ -616,7 +729,7 @@ class PanelTests(unittest.IsolatedAsyncioTestCase):
              patch("modules.roulette.random.choice", return_value="1"), \
              patch("modules.roulette.send_game_reminder_prompt",
                    new=AsyncMock(side_effect=lambda *args: events.append("prompt"))):
-            await Roulette.ruleta.callback(Roulette(None), context, 100, "red")
+            await Roulette.ruleta(Roulette(None), context, 100, "red")
         self.assertEqual(events, ["message", "settle", "cooldown", "message", "prompt"])
 
 

@@ -62,7 +62,7 @@ from core.database import (
     release_cargo_claim, delete_cargo_temporal_by_id,
     create_game_config_table, load_game_config, load_dados_config, load_memo_config,
     load_veterano_config_to_cache, load_saboteador_config_to_cache, load_item_role_restrictions_to_cache,
-    save_collect_cooldowns, load_evento_to_cache, flush_evento_puntos,
+    save_collect_cooldowns,
     recover_pending_wagers, ensure_wager_constraints,
     get_inactive_user_ids, get_user_deletion_blocker,
     get_user_temporary_roles, purge_user_data, touch_user_activity,
@@ -70,7 +70,6 @@ from core.database import (
     delete_expired_failed_item_use_logs,
 )
 from core import cache
-from core.member_tenure import NEW_MEMBER_MESSAGE, has_minimum_server_tenure
 from core.halloween import init_halloween_tables
 from core.game_reminders import init_game_reminders, game_reminder_worker
 from core.config import (
@@ -131,6 +130,26 @@ intents.message_content = False
 intents.members = False
 intents.messages = False
 
+async def check_restricted_interaction(interaction: discord.Interaction) -> bool:
+    """Bloquea botones y formularios abiertos antes de aplicar /punish."""
+    guild_id = getattr(interaction, "guild_id", None)
+    if guild_id is None:
+        return True
+    expires_at = cache.get_active_cargo_expiry(
+        interaction.user.id, guild_id, PUNISHMENT_ROLE_ID,
+    )
+    if not expires_at:
+        return True
+    if interaction.type is discord.InteractionType.autocomplete:
+        await interaction.response.autocomplete([])
+    else:
+        await interaction.response.send_message(
+            "Tu acceso está **Restringido** debido a un uso incorrecto del canal. "
+            f"Podrás volver a interactuar en <t:{int(expires_at)}:R>.",
+            ephemeral=True,
+        )
+    return False
+
 async def check_player_access(interaction: discord.Interaction) -> bool:
     """Protege tanto los paneles slash como cada botón que ejecuta acciones."""
     async def deny(message: str) -> bool:
@@ -142,51 +161,23 @@ async def check_player_access(interaction: discord.Interaction) -> bool:
 
     if interaction.guild is None:
         return await deny("Este panel solo está disponible en el servidor.")
+    if not await check_restricted_interaction(interaction):
+        return False
     if PLAYER_COMMAND_ROLE_ID not in {
         role.id for role in getattr(interaction.user, "roles", ())
     }:
         return await deny(
             "No tienes el rol necesario para usar los comandos de jugador."
         )
-    expires_at = cache.get_active_cargo_expiry(
-        interaction.user.id, interaction.guild.id, PUNISHMENT_ROLE_ID,
-    )
-    if expires_at:
-        return await deny(
-            "Tu acceso está **Restringido**. Podrás volver a interactuar "
-            f"<t:{int(expires_at)}:R>."
-        )
-    eligible = await check_invoker_tenure(interaction.user, interaction.guild)
-    if eligible is not True:
-        return await deny(
-            NEW_MEMBER_MESSAGE if eligible is False
-            else "No pude verificar tu antigüedad. Inténtalo nuevamente."
-        )
     return True
-
-
-async def check_invoker_tenure(user, guild) -> bool | None:
-    """No enumera miembros; consulta por ID solo si falta joined_at."""
-    if guild is None:
-        return None
-    joined_at = getattr(user, "joined_at", None)
-    if joined_at is None:
-        try:
-            member = await asyncio.wait_for(guild.fetch_member(user.id), timeout=2.0)
-            joined_at = member.joined_at
-        except (
-            asyncio.TimeoutError, discord.NotFound, discord.Forbidden,
-            discord.HTTPException, discord.ClientException,
-        ):
-            return None
-    if joined_at is None:
-        return None
-    return has_minimum_server_tenure(joined_at)
 
 
 class PurpleJackCommandTree(app_commands.CommandTree):
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
         command_name = (interaction.data or {}).get("name")
+        if command_name not in {"ayuda_nave", "eliminar_mis_datos"}:
+            if not await check_restricted_interaction(interaction):
+                return False
         if command_name in {
             "jugar", "trabajar", "consultar", "work", "crime", "collect",
             "tienda", "rob", "Robar", "carrera", "retar",
@@ -194,18 +185,7 @@ class PurpleJackCommandTree(app_commands.CommandTree):
             return await check_player_access(interaction)
         if command_name in {"ayuda_nave", "eliminar_mis_datos"}:
             return True
-        eligible = await check_invoker_tenure(interaction.user, interaction.guild)
-        if eligible is True:
-            return True
-        if interaction.type is discord.InteractionType.autocomplete:
-            await interaction.response.autocomplete([])
-            return False
-        message = (
-            NEW_MEMBER_MESSAGE if eligible is False
-            else "No pude verificar tu antigüedad en el servidor. Inténtalo nuevamente."
-        )
-        await interaction.response.send_message(message, ephemeral=True)
-        return False
+        return True
 
 bot = commands.Bot(
     command_prefix=[],
@@ -217,16 +197,12 @@ bot = commands.Bot(
 )
 
 
-@bot.event
-async def on_message(message: discord.Message) -> None:
-    """No inspecciona mensajes ni despacha los antiguos comandos con !."""
-    return
-evento_flush_task = None
 cargos_task = None
 wager_recovery_task = None
 inactive_purge_task = None
 log_cleanup_task = None
 game_reminder_task = None
+cache_flush_task = None
 slash_sync_done = False
 _activity_writes = {}
 bot._user_activity_writes = _activity_writes
@@ -235,45 +211,6 @@ USER_INACTIVITY_RETENTION = 30 * 24 * 60 * 60
 USER_ACTIVITY_WRITE_INTERVAL = 60 * 60
 INACTIVE_PURGE_INTERVAL = 6 * 60 * 60
 LOG_CLEANUP_JOB_NAME = "discord-log-retention"
-
-
-class CommandAccessRestricted(commands.CheckFailure):
-    """Evita que un usuario castigado ejecute comandos con prefijo."""
-
-
-@bot.check
-async def block_restricted_prefix_commands(ctx: commands.Context) -> bool:
-    if ctx.guild is None:
-        return True
-
-    expires_at = cache.get_active_cargo_expiry(
-        ctx.author.id,
-        ctx.guild.id,
-        PUNISHMENT_ROLE_ID,
-    )
-    if not expires_at:
-        return True
-
-    await ctx.reply(
-        "Tu acceso está **Restringido** debido a un uso incorrecto del canal. "
-        f"Podrás volver a interactuar en <t:{int(expires_at)}:R>",
-        mention_author=False,
-        delete_after=3,
-    )
-    raise CommandAccessRestricted()
-
-
-@bot.check
-async def block_new_prefix_members(ctx: commands.Context) -> bool:
-    eligible = await check_invoker_tenure(ctx.author, ctx.guild)
-    if eligible is True:
-        return True
-    message = (
-        NEW_MEMBER_MESSAGE if eligible is False
-        else "No pude verificar tu antigüedad en el servidor. Inténtalo nuevamente."
-    )
-    await ctx.reply(message, mention_author=False)
-    raise CommandAccessRestricted()
 
 
 async def record_user_activity(user_id: int) -> None:
@@ -689,23 +626,8 @@ async def log_retention_worker():
             await asyncio.sleep(60)
 
 
-@bot.event
-async def on_command_error(ctx, error):
-    if isinstance(error, CommandAccessRestricted):
-        return
-    if isinstance(error, commands.CommandNotFound):
-        await ctx.reply(
-            "❌ Este comando no es válido, Consulta la Guia de la Nave en <#1505296434076057752>",
-            delete_after=10
-        )
-    elif isinstance(error, commands.CommandOnCooldown):
-        return  # deja que el handler del módulo lo maneje
-    else:
-        raise error
-
 async def shutdown():
     logger.warning("Apagando bot — flusheando caché a DB...")
-    await flush_evento_puntos()
     await cache.flush_to_db()
     # ── Persistir cooldowns de collect pendientes en cache ──
     all_cooldowns = cache.get_all_collect_cooldowns()
@@ -781,8 +703,9 @@ async def sync_slash_commands(client: commands.Bot) -> None:
 
 @bot.event
 async def on_ready():
-    global evento_flush_task, cargos_task, wager_recovery_task
+    global cargos_task, wager_recovery_task
     global inactive_purge_task, log_cleanup_task, game_reminder_task, slash_sync_done
+    global cache_flush_task
     logger.info(f"Bot conectado como {bot.user}")
     logger.info(
         "Caché iniciada | Flush cada %s segundos",
@@ -802,16 +725,14 @@ async def on_ready():
             await bot.close()
             return
 
-    asyncio.create_task(cache.flush_loop())
+    if cache_flush_task is None or cache_flush_task.done():
+        cache_flush_task = asyncio.create_task(cache.flush_loop(), name="economy-cache-flush")
     if not TEST_MODE and (cargos_task is None or cargos_task.done()):
         cargos_task = asyncio.create_task(
             check_cargos_loop(),
             name="cargos-temporales-worker",
         )
         logger.info("Task de cargos temporales iniciada | Revisión persistente cada 30 segundos")
-    if not TEST_MODE and (evento_flush_task is None or evento_flush_task.done()):
-        evento_flush_task = asyncio.create_task(cache.evento_flush_loop())
-        logger.info("Task de evento iniciada | Flush de ranking cada 10 minutos")
     if wager_recovery_task is None or wager_recovery_task.done():
         wager_recovery_task = asyncio.create_task(
             recover_expired_wagers_loop(),
@@ -886,7 +807,6 @@ def run_bot():
             ("Configuración Collect", load_collect_config_to_cache),
             ("Configuración Veterano", load_veterano_config_to_cache),
             ("Configuración Saboteador", load_saboteador_config_to_cache),
-            ("Puntos de evento", load_evento_to_cache),
         ):
             await _startup_step(label, startup_call())
         await _startup_step("Carga de extensiones", load_modules())
@@ -902,7 +822,6 @@ def run_bot():
                 f"Inicio fallido en Discord: {type(error).__name__}: {safe_error}"
             ) from None
         finally:
-            await flush_evento_puntos()
             await cache.flush_to_db()
             logger.info("Flush final completado al cerrar.")
 

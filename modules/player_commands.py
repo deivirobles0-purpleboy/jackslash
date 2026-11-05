@@ -27,7 +27,7 @@ class PlayerCommands(commands.Cog):
             await interaction.followup.send("Esta función no está disponible.", ephemeral=True)
             return
         try:
-            await getattr(cog, command_name).callback(cog, context, *args)
+            await getattr(cog, command_name)(context, *args)
         except Exception:
             logger.exception("Falló /%s para %s", command_name, interaction.user.id)
             await interaction.followup.send(
@@ -61,7 +61,23 @@ class PlayerCommands(commands.Cog):
             )
             return
         self._tienda_last_used[interaction.user.id] = time.monotonic()
-        await self._execute(interaction, "Shop", "tienda")
+        await interaction.response.defer(ephemeral=True)
+        from core.database import get_all_items
+        from modules.shop import TiendaLayout
+        try:
+            items = await get_all_items()
+            if not items:
+                await interaction.followup.send("🛒 La tienda está vacía por ahora.", ephemeral=True)
+                return
+            await interaction.followup.send(
+                view=TiendaLayout(sorted(items, key=lambda item: item["precio"]),
+                                  interaction.user.id, self.bot),
+                ephemeral=True,
+            )
+        except Exception:
+            logger.exception("No se pudo abrir /tienda para %s", interaction.user.id)
+            self._tienda_last_used.pop(interaction.user.id, None)
+            await interaction.followup.send("❌ No pude abrir la tienda.", ephemeral=True)
 
     @app_commands.command(name="rob", description="Intenta robar a otro miembro")
     @app_commands.describe(usuario="Miembro al que intentarás robar")

@@ -148,7 +148,8 @@ class BlackjackView(discord.ui.View):
 
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
         if interaction.user.id == self.game.user_id:
-            return True
+            from bot import check_restricted_interaction
+            return await check_restricted_interaction(interaction)
         await interaction.response.send_message(
             "❌ Esta mesa de Blackjack no te pertenece.",
             ephemeral=True,
@@ -488,7 +489,6 @@ class Blackjack(commands.Cog):
     def __init__(self, bot):
         self.bot = bot
 
-    @commands.command(name="bj")
     async def blackjack(self, ctx, apuesta: int = None):
         message_id = ctx.message.id
         if message_id in _SEEN_BLACKJACK_MESSAGES:
@@ -582,15 +582,6 @@ class Blackjack(commands.Cog):
                 except Exception:
                     logger.exception("No se pudo reembolsar el inicio fallido de BJ.")
                 raise
-
-    @blackjack.error
-    async def blackjack_error(self, ctx, error):
-        if isinstance(error, (commands.BadArgument, commands.MissingRequiredArgument)):
-            await ctx.send(
-                f"❌ {ctx.author.mention} Abre **/jugar apuesta** y selecciona **Blackjack**."
-            )
-            return
-        raise error
 
 
 async def setup(bot):

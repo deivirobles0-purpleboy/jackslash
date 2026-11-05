@@ -21,13 +21,9 @@ from core.config import (
 )
 from core.cache import MAX_BANK
 from core.rankings import get_balance_ranking
-from core.member_resolution import resolve_guild_member
 from core.halloween import CANDY, get_candy_balance
 
 TOP_COOLDOWN = 300
-EVENTO_THUMBNAIL_URL = "https://pub-a09b3609b6b34dfab5c7aa7742cd1a8a.r2.dev/Purple%20jack%20Harcode/PurpleThumb.png"
-EVENTO_TASA_DEPOSITO = 30
-EVENTO_TOP_ICON = "<:ygoldstar:1004555717610590258>"
 NAVE_SUPPORT_URL = "https://canary.discord.com/channels/980073134411644939/1399742637426081913"
 NAVE_DATA_CHANNEL_ID = 1505296434076057752
 NAVE_BUGS_CHANNEL_ID = 1534744435814826205
@@ -435,19 +431,6 @@ def _format_cooldown(seconds: int) -> str:
     return f"{seconds}s"
 
 
-async def _finalizar_consulta_evento(message: discord.Message) -> None:
-    await asyncio.sleep(60)
-    try:
-        await message.edit(
-            embed=discord.Embed(
-                title="**🔰 Consulta del Evento PurpleCoins Finalizada...**",
-                color=discord.Color.purple(),
-            )
-        )
-    except (discord.NotFound, discord.HTTPException):
-        pass
-
-
 def _add_collect_fields(embed: discord.Embed):
     collect_config = cache.get_collect_config()
     if not collect_config:
@@ -519,9 +502,17 @@ def _build_collects_embed() -> discord.Embed:
 
 
 class CooldownsPanelView(ui.View):
-    def __init__(self):
+    def __init__(self, owner_id: int):
         super().__init__(timeout=40)
+        self.owner_id = owner_id
         self.message: discord.Message | None = None
+
+    async def interaction_check(self, interaction: Interaction) -> bool:
+        if interaction.user.id == self.owner_id:
+            from bot import check_player_access
+            return await check_player_access(interaction)
+        await interaction.response.send_message("Este panel no es tuyo.", ephemeral=True)
+        return False
 
     @ui.button(label="Cooldowns", style=ButtonStyle.green)
     async def cooldowns(self, interaction: Interaction, button: ui.Button):
@@ -535,24 +526,11 @@ class CooldownsPanelView(ui.View):
         await interaction.response.send_message(embed=_build_collects_embed(), ephemeral=True)
 
     async def on_timeout(self):
-        if self.message is None:
-            return
-
-        expired_embed = discord.Embed(
-            title="Consulta **/consultar** → **CD** para ver cooldowns y collects.",
-            color=discord.Color.purple(),
-        )
+        for button in self.children:
+            button.disabled = True
         try:
-            await self.message.edit(embed=expired_embed, view=None)
-        except discord.HTTPException:
-            return
-
-        asyncio.create_task(self._delete_expired_message())
-
-    async def _delete_expired_message(self):
-        await asyncio.sleep(60)
-        try:
-            await self.message.delete()
+            if self.message is not None:
+                await self.message.edit(view=self)
         except discord.HTTPException:
             pass
 
@@ -562,6 +540,10 @@ class FinanceView(ui.View):
         super().__init__(timeout=60)
         self.user_id = user_id
         self.message: discord.Message | None = None
+
+    async def interaction_check(self, interaction: Interaction) -> bool:
+        from bot import check_player_access
+        return await check_player_access(interaction)
 
     @ui.button(label="Depositar", style=ButtonStyle.green)
     async def depositar(self, interaction: Interaction, button: ui.Button):
@@ -590,7 +572,7 @@ class FinanceView(ui.View):
                 "❌ No es tu menú.", ephemeral=True,
             )
         from modules.craft import open_craft_panel
-        await open_craft_panel(interaction)
+        await open_craft_panel(interaction, balance_message=self.message)
 
     @ui.button(label="Salir", style=ButtonStyle.danger)
     async def salir(self, interaction: Interaction, button: ui.Button):
@@ -637,6 +619,9 @@ class DepositModal(ui.Modal, title="Depositar al Banco"):
         self.message = message
 
     async def on_submit(self, interaction: Interaction):
+        from bot import check_restricted_interaction
+        if not await check_restricted_interaction(interaction):
+            return
         await interaction.response.defer(ephemeral=True)
         try:
             # Una sola llamada — get_user es cache-first, sin hit extra a DB
@@ -667,12 +652,8 @@ class DepositModal(ui.Modal, title="Depositar al Banco"):
             aplicado_banco    = min(amount, espacio_disponible)
             excedente_balance = amount - aplicado_banco
 
-            # El depósito no descuenta el total del evento: solo el 30 % de
-            # lo que realmente pudo entrar al banco.
             await update_balance(self.user_id, -amount, track_event=False)
             aplicado_banco = await update_bank(self.user_id, amount, track_event=False)
-            descuento_evento = aplicado_banco * EVENTO_TASA_DEPOSITO // 100
-            cache.record_evento_balance_delta(self.user_id, -descuento_evento)
 
             # Refrescar datos para actualizar el embed
             user = await get_user(self.user_id)
@@ -706,6 +687,9 @@ class WithdrawModal(ui.Modal, title="Retirar del Banco"):
         self.message = message
 
     async def on_submit(self, interaction: Interaction):
+        from bot import check_restricted_interaction
+        if not await check_restricted_interaction(interaction):
+            return
         await interaction.response.defer(ephemeral=True)
         try:
             # Una sola llamada — get_user es cache-first, sin hit extra a DB
@@ -742,7 +726,6 @@ class Economy(commands.Cog):
     def __init__(self, bot):
         self.bot = bot
 
-    @commands.command(name="bal")
     async def balance(self, ctx):
         user = await get_user(ctx.author.id)
         candy_balance = await get_candy_balance(ctx.author.id)
@@ -760,22 +743,6 @@ class Economy(commands.Cog):
     def format_cooldown(self, seconds: int) -> str:
         return _format_cooldown(seconds)
 
-    async def cog_command_error(self, ctx, error):
-        if isinstance(error, commands.CommandOnCooldown):
-            retry = int(error.retry_after)
-            if retry >= 60:
-                tiempo = f"{retry // 60}m {retry % 60}s" if retry % 60 else f"{retry // 60}m"
-            else:
-                tiempo = f"{retry}s"
-            await ctx.send(
-                f"⏳ {ctx.author.mention} Podrás usar este comando de nuevo en **{tiempo}**.",
-                delete_after=10,
-            )
-        else:
-            raise error
-
-    @commands.command(name="cd")
-    @commands.cooldown(1, 30, commands.BucketType.user)
     async def cooldowns(self, ctx):
         embed = discord.Embed(
             title="**INFO:** CD y Collects Activos",
@@ -785,12 +752,11 @@ class Economy(commands.Cog):
             ),
             color=discord.Color.purple(),
         )
-        embed.set_footer(text=">> Cualquiera puede usar este panel <<")
-        view = CooldownsPanelView()
+        embed.set_footer(text="Panel privado de consultas")
+        view = CooldownsPanelView(ctx.author.id)
         message = await ctx.send(embed=embed, view=view)
         view.message = message
 
-    @commands.command()
     async def top(self, ctx):
         if ctx.guild is None:
             return await ctx.send("❌ Este ranking solo está disponible en un servidor.")
@@ -827,53 +793,6 @@ class Economy(commands.Cog):
             embed=embed, delete_after=60,
             allowed_mentions=discord.AllowedMentions.none(),
         )
-
-    @commands.command(name="evento")
-    async def evento(self, ctx):
-        if not cache.is_evento_activo():
-            resultados_anteriores = cache.get_evento_top(4)
-            if not resultados_anteriores:
-                return await ctx.reply(
-                    "❌ No hay un evento de Purple Coins activo actualmente.",
-                    delete_after=15,
-                )
-
-            lineas = []
-            for user_id, puntos in resultados_anteriores:
-                member = await resolve_guild_member(ctx.guild, user_id)
-                nombre = (member.nick or member.display_name) if member else f"Usuario {user_id}"
-                lineas.append(f"{COIN} {nombre} —— {COIN} **{puntos}**")
-
-            embed = discord.Embed(
-                title="Ultimos Ganadores del Evento",
-                description="\n".join(lineas),
-                color=discord.Color.purple(),
-            )
-            embed.set_footer(text="No hay Evento Activo, Espera el Proximo Anuncio...")
-            embed.set_thumbnail(url=EVENTO_THUMBNAIL_URL)
-            return await ctx.send(embed=embed, delete_after=60)
-
-        resultados = cache.get_evento_top(10)
-        if resultados:
-            lineas = []
-            for indice, (user_id, puntos) in enumerate(resultados):
-                member = await resolve_guild_member(ctx.guild, user_id)
-                nombre = (member.nick or member.display_name) if member else f"Usuario {user_id}"
-                posicion = EVENTO_TOP_ICON if indice < 4 else f"**{indice + 1}.**"
-                lineas.append(f"{posicion} {nombre} —— {COIN} **{puntos}**")
-            descripcion = "\n".join(lineas)
-        else:
-            descripcion = "Aún no se registran ingresos en este evento."
-
-        embed = discord.Embed(
-            title="TOP EVENTO PURPLE COINS",
-            description=descripcion,
-            color=discord.Color.gold(),
-        )
-        embed.set_footer(text="Retiros del banco y collects no suman puntos.")
-        embed.set_thumbnail(url=EVENTO_THUMBNAIL_URL)
-        message = await ctx.send(embed=embed)
-        asyncio.create_task(_finalizar_consulta_evento(message))
 
     @app_commands.command(name="ayuda_nave", description="Presentación y guía de comandos de PurpleJack")
     async def ayuda_nave(self, interaction: discord.Interaction):

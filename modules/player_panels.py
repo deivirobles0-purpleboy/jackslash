@@ -20,6 +20,15 @@ GAMES = {
     "bj": ("🃏 Blackjack", "Blackjack", "blackjack"),
     "memo": ("🧠 Memo", "Memo", "memo"),
 }
+_open_game_panels: dict[int, set["GamePanel"]] = {}
+
+
+def _forget_game_panel(panel: "GamePanel") -> None:
+    panels = _open_game_panels.get(panel.owner_id)
+    if panels is not None:
+        panels.discard(panel)
+        if not panels:
+            _open_game_panels.pop(panel.owner_id, None)
 JUGAR_THUMBNAIL = (
     "https://pub-a09b3609b6b34dfab5c7aa7742cd1a8a.r2.dev/"
     "Purple%20jack%20Harcode/jugar.png"
@@ -42,8 +51,7 @@ async def _delete_panel_after(view: discord.ui.LayoutView, message, delay: int) 
     view.stop()
     if isinstance(view, GamePanel):
         view.expired = True
-        if view._poll_task is not None:
-            view._poll_task.cancel()
+        _forget_game_panel(view)
     try:
         await message.delete()
     except (discord.HTTPException, discord.NotFound):
@@ -166,7 +174,6 @@ class GamePanel(discord.ui.LayoutView):
         self.active_since: dict[str, float] = {}
         self.cooldowns: dict[str, float] = {}
         self._lock = asyncio.Lock()
-        self._poll_task: asyncio.Task | None = None
         self.expired = False
 
     async def refresh(self):
@@ -225,9 +232,9 @@ class GamePanel(discord.ui.LayoutView):
             try:
                 command = getattr(cog, GAMES[game][2])
                 if game == "ruleta":
-                    await command.callback(cog, ctx, self.bet, option)
+                    await command(ctx, self.bet, option)
                 else:
-                    await command.callback(cog, ctx, self.bet)
+                    await command(ctx, self.bet)
             except Exception:
                 failed = True
                 logger.exception("Falló el inicio de %s desde /jugar", game)
@@ -247,38 +254,24 @@ class GamePanel(discord.ui.LayoutView):
                             await self.message.edit(view=self)
                         except discord.HTTPException:
                             pass
-                if not self.expired and (self._poll_task is None or self._poll_task.done()):
-                    self._poll_task = asyncio.create_task(self._poll())
-
-    async def _poll(self):
-        deadline = time.monotonic() + 900
-        while not self.expired and time.monotonic() < deadline:
-            upcoming = [expiry for expiry in self.cooldowns.values() if expiry > time.time()]
-            delay = 2 if self.active else min(30, max(2, min(upcoming) - time.time())) if upcoming else 30
-            await asyncio.sleep(delay)
-            changed = False
-            now = time.time()
-            for game in GAMES:
-                previous = self.cooldowns.get(game, 0)
-                expiry = await _cooldown(self.owner_id, game)
-                if expiry != previous or (previous > now - delay) != (previous > now):
-                    changed = True
-                if game in self.active and (expiry > now or
-                    time.monotonic() - self.active_since.get(game, 0) >= 180):
-                    self.active.discard(game)
-                    self.active_since.pop(game, None)
-                    changed = True
-            if changed:
-                await self.refresh()
-                try:
-                    if self.message is not None:
-                        await self.message.edit(view=self)
-                except discord.HTTPException:
-                    return
-
     async def on_timeout(self):
-        if self._poll_task:
-            self._poll_task.cancel()
+        _forget_game_panel(self)
+
+
+async def notify_game_finished(user_id: int, game: str, expires_at: float) -> None:
+    """Actualiza los paneles abiertos al liquidar un juego, sin sondeo a Aiven."""
+    for panel in tuple(_open_game_panels.get(user_id, ())):
+        if panel.expired or game not in GAMES:
+            continue
+        panel.active.discard(game)
+        panel.active_since.pop(game, None)
+        panel.cooldowns[game] = expires_at
+        panel.build()
+        if panel.message is not None:
+            try:
+                await panel.message.edit(view=panel)
+            except discord.HTTPException:
+                logger.warning("No se pudo actualizar /jugar de %s tras %s", user_id, game)
 
 
 class RouletteNumber(discord.ui.Modal, title="Número de ruleta"):
@@ -369,10 +362,11 @@ class SimplePanelButton(discord.ui.Button):
             if not items:
                 await interaction.followup.send("🎒 Tu inventario está vacío.", ephemeral=True)
             else:
-                await interaction.followup.send(
-                    view=InventarioLayout(items, interaction.user.id,
-                                         interaction.guild, interaction.client),
-                    ephemeral=True,
+                inventory = InventarioLayout(
+                    items, interaction.user.id, interaction.guild, interaction.client,
+                )
+                inventory.message = await interaction.followup.send(
+                    view=inventory, ephemeral=True, wait=True,
                 )
             return
         cog_name, command_name = {
@@ -397,10 +391,7 @@ class SimplePanelButton(discord.ui.Button):
         )
         try:
             command = getattr(cog, command_name)
-            if isinstance(command, commands.Command):
-                await command.callback(cog, ctx)
-            else:
-                await command(ctx)
+            await command(ctx)
         except Exception:
             logger.exception("Falló /%s: %s", view.kind, self.mode)
             await interaction.followup.send("No pude completar esta acción.", ephemeral=True)
@@ -425,9 +416,9 @@ class NameModal(discord.ui.Modal):
         try:
             command = getattr(cog, method)
             if self.mode == "info":
-                await command.callback(cog, ctx, nombre=self.name.value)
+                await command(ctx, nombre=self.name.value)
             else:
-                await command.callback(cog, ctx, self.name.value)
+                await command(ctx, self.name.value)
         except Exception:
             logger.exception("Falló el modal %s", self.mode)
             await interaction.followup.send("No pude completar la consulta.", ephemeral=True)
@@ -499,16 +490,21 @@ class PlayerPanels(commands.Cog):
         panel.message = await interaction.followup.send(
             view=panel, ephemeral=True, wait=True,
         )
-        panel._poll_task = asyncio.create_task(panel._poll())
+        _open_game_panels.setdefault(interaction.user.id, set()).add(panel)
         asyncio.create_task(_delete_panel_after(
             panel, panel.message, PANEL_LIFETIME_SECONDS,
         ))
 
     @app_commands.command(name="trabajar", description="Abre el centro de empleos")
     async def trabajar(self, interaction: discord.Interaction):
-        await interaction.response.send_message(
-            view=SimplePanel(interaction.user.id, "trabajar"), ephemeral=True,
+        await interaction.response.defer(ephemeral=True)
+        panel = SimplePanel(interaction.user.id, "trabajar")
+        message = await interaction.followup.send(
+            view=panel, ephemeral=True, wait=True,
         )
+        asyncio.create_task(_delete_panel_after(
+            panel, message, PANEL_LIFETIME_SECONDS,
+        ))
 
     @app_commands.command(name="consultar", description="Consulta tus datos y recursos")
     async def consultar(self, interaction: discord.Interaction):

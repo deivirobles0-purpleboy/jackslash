@@ -49,7 +49,6 @@ class BasicGames(commands.Cog):
     def __init__(self, bot):
         self.bot = bot
 
-    @commands.command()
     async def work(self, ctx):
         now = int(time.time())
         cooldown, cd_boost = await resolve_cd_boost(
@@ -83,7 +82,6 @@ class BasicGames(commands.Cog):
         response = await ctx.message.reply(f"{nick} {msg}", mention_author=False)
         await send_cd_boost_notice(response, ctx.author, cd_boost)
 
-    @commands.command()
     async def crime(self, ctx):
         now = int(time.time())
         cooldown, cd_boost = await resolve_cd_boost(

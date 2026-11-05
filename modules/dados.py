@@ -67,6 +67,10 @@ class DadosRollView(discord.ui.View):
         self.processing = False
         self.resolution_lock = asyncio.Lock()
 
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        from bot import check_restricted_interaction
+        return await check_restricted_interaction(interaction)
+
     async def on_timeout(self):
         async with self.resolution_lock:
             if self.finished or self.processing:
@@ -231,7 +235,6 @@ class Dados(commands.Cog):
     def __init__(self, bot):
         self.bot = bot
 
-    @commands.command(name="dados")
     async def dados(self, ctx, monto: int = None):
         # Un mismo MessageCreate no debe ejecutarse dos veces dentro de esta
         # instancia. La idempotencia en DB cubre además las otras instancias.

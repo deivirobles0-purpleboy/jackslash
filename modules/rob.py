@@ -21,7 +21,6 @@ from core.member_resolution import resolve_explicit_member
 SABOTEADOR_EXITO_PROB = 0.60
 SABOTEADOR_ROBO_PORCENTAJE = 0.20
 SABOTEADOR_FALLO_PORCENTAJE = 0.15
-EVENT_ROB_VICTIM_PENALTY_PERCENT = 30
 
 
 def _format_rob_cooldown(seconds: int) -> str:
@@ -34,11 +33,6 @@ def _format_rob_cooldown(seconds: int) -> str:
     if minutos > 0:
         return f"{minutos}m {segs}s"
     return f"{segs}s"
-
-
-def _apply_event_victim_penalty(user_id: int, stolen_amount: int) -> None:
-    penalty = stolen_amount * EVENT_ROB_VICTIM_PENALTY_PERCENT // 100
-    cache.record_evento_balance_delta(user_id, -penalty)
 
 
 async def _reply_recent_victim(ctx, target: discord.Member) -> None:
@@ -63,7 +57,6 @@ class Rob(commands.Cog):
         await set_command_cooldown("user", user_id, "rob", expira_en)
         return cd_boost
 
-    @commands.command()
     async def rob(self, ctx, target_input: discord.Member | str | None = None):
         if not rob_config["activa"]:
             return await ctx.send(
@@ -170,7 +163,6 @@ class Rob(commands.Cog):
                     return await ctx.send(
                         "⚠️ El saldo del objetivo cambió durante el robo. Inténtalo de nuevo."
                     )
-                _apply_event_victim_penalty(target_id, monto_robo)
                 response_message = await ctx.message.reply(
                     f"😈 Logras romper la Protección del **Veterano** de {target_nick} "
                     f"y le sacas **{monto_robo:,}** {COIN}.",
@@ -202,7 +194,6 @@ class Rob(commands.Cog):
                     return await ctx.send(
                         "⚠️ El saldo del objetivo cambió durante el robo. Inténtalo de nuevo."
                     )
-                _apply_event_victim_penalty(target_id, monto_robo)
                 response_message = await ctx.message.reply(
                     f"✅ Robo exitoso. Le sacaste **{monto_robo:,}** {COIN} a {target.mention} "
                     f"sin que se diera cuenta."

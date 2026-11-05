@@ -41,7 +41,6 @@ class Roulette(commands.Cog):
     def __init__(self, bot):
         self.bot = bot
 
-    @commands.command()
     async def ruleta(self, ctx, apuesta: int = None, espacio: str = None):
         if not ruleta_config["activa"]:
             return await ctx.send(

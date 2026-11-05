@@ -59,6 +59,10 @@ class MemoView(discord.ui.View):
         self._interaction_lock = asyncio.Lock()
         self._build_buttons()
 
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        from bot import check_restricted_interaction
+        return await check_restricted_interaction(interaction)
+
     def _build_buttons(self):
         self.clear_items()
         for i in range(16):
@@ -343,7 +347,6 @@ class Memo(commands.Cog):
     def __init__(self, bot):
         self.bot = bot
 
-    @commands.command(name="memo")
     async def memo(self, ctx, monto: int = None):
         user_id = ctx.author.id
         now     = time.time()
@@ -422,16 +425,6 @@ class Memo(commands.Cog):
             _active_memo.discard(user_id)
             await refund_wager(wager["id"])
             raise
-
-    @memo.error
-    async def memo_error(self, ctx, error):
-        if isinstance(error, commands.BadArgument):
-            await ctx.send(
-                f"❌ {ctx.author.mention} El monto debe ser un número entero. "
-                "Abre **/jugar apuesta** y selecciona **Memo**."
-            )
-        else:
-            raise error
 
 
 async def setup(bot):

@@ -147,7 +147,7 @@ def _es_coordinador(member: discord.Member) -> bool:
 def _ofrecer_recordatorio_trabajo(interaction, author, settlement: dict) -> None:
     """Ofrece el aviso tras liquidar y mostrar el resultado de una jornada."""
     expires_at = settlement.get("cooldown_expires_at")
-    if interaction is None or not expires_at or _es_coordinador(author):
+    if interaction is None or not expires_at:
         return
     asyncio.create_task(send_game_reminder_prompt(
         interaction, author.id, "trabajar", expires_at,
@@ -167,7 +167,7 @@ def _puede_acceder_oficina(data: dict | None, member: discord.Member) -> bool:
 
 # ── DEBUG DE INTERACCIONES ───────────────────────────────
 def _log_trabajar_error(empleo: str, error: Exception, usuario: str = "?", contexto: str = ""):
-    """Log estandarizado para errores en tableros de !trabajar."""
+    """Log estandarizado para errores en tableros de /trabajar."""
     tipo   = type(error).__name__
     lineas = traceback.extract_tb(error.__traceback__)
     ultima = lineas[-1] if lineas else None
@@ -703,7 +703,7 @@ async def cancelar_jornada_por_inactividad(
     """Cancela una sesión sin liquidación y deja su cooldown correctamente fijado.
 
     El lock laboral se toma antes que el de la sesión, igual que al crear o
-    liquidar una jornada. Así un clic tardío, el worker y ``!trabajar`` no
+    liquidar una jornada. Así un clic tardío, el worker y ``/trabajar`` no
     pueden duplicar pagos ni dejar una sesión activa bloqueada.
     """
     now = time.time()
@@ -834,7 +834,7 @@ async def _finalizar_jornada_atomica_unlocked(
     async with pool.acquire() as conn:
         async with conn.transaction():
             # Mismo orden de locks que crear_jornada: empleo -> sesión -> economía.
-            # Evita deadlocks entre un clic final y otro !trabajar simultáneo.
+            # Evita deadlocks entre un clic final y otro /trabajar simultáneo.
             empleo_row = await conn.fetchrow(
                 "SELECT * FROM empleos_users WHERE user_id=$1 FOR UPDATE",
                 user_id,
@@ -975,8 +975,6 @@ async def _finalizar_jornada_atomica_unlocked(
 
     if user_row:
         economy_cache.set_cache(user_id, dict(user_row))
-    if overflow_balance:
-        economy_cache.record_evento_balance_delta(user_id, overflow_balance)
     if empleo_actualizado:
         data = dict(empleo_actualizado)
         data["historial_reciente_de_jornadas"] = _parse_historial_jornadas(
@@ -1307,7 +1305,7 @@ def nombre_empleo(empleo: str | None) -> str:
 
 
 def build_exp_embed(member: discord.Member, data: dict) -> discord.Embed:
-    """Construye el mismo resumen laboral que muestra el comando !exp."""
+    """Construye el resumen laboral mostrado desde /trabajar."""
     empleo = data.get("empleo_actual") or "Sin empleo"
     embed = discord.Embed(
         title=f"📊 Experiencia Laboral - {member.display_name}",
@@ -1368,7 +1366,7 @@ def build_empleos_maestria_embed() -> discord.Embed:
 
 
 async def renunciar_empleo(member: discord.Member) -> tuple[bool, str]:
-    """Aplica la misma baja y cooldown que el comando !renunciar."""
+    """Aplica la baja y cooldown desde /trabajar."""
     if await get_jornada_activa(member.id):
         return False, "⌛ Finaliza primero tu jornada laboral activa."
 
@@ -1408,6 +1406,9 @@ class ConfirmarEmpleoView(ui.View):
     async def aceptar(self, interaction: Interaction, button: ui.Button):
         if interaction.user.id != self.user_id:
             return await interaction.response.send_message("❌ No es tu confirmación.", ephemeral=True)
+        from bot import check_restricted_interaction
+        if not await check_restricted_interaction(interaction):
+            return
         if self._interaction_lock.locked() or self.procesado:
             return await interaction.response.send_message(
                 "⌛ Esta solicitud ya se está procesando.",
@@ -1554,6 +1555,9 @@ class OficinaBaseView(ui.View):
     async def validar_interaccion(self, interaction: Interaction) -> bool:
         if interaction.user.id != self.owner_id:
             await interaction.response.send_message("❌ Este panel no es tuyo.", ephemeral=True)
+            return False
+        from bot import check_restricted_interaction
+        if not await check_restricted_interaction(interaction):
             return False
         if time.time() >= self.expires_at:
             await interaction.response.send_message(
@@ -1904,7 +1908,6 @@ class Empleos(commands.Cog):
         embed.set_footer(text="Abre /trabajar y pulsa Aplicar para elegir un empleo.")
         await ctx.send(embed=embed)
 
-    @commands.command(name="aplicar")
     async def aplicar(self, ctx, empleo: str = None):
         if not empleo:
             return await ctx.send("❌ Abre **/trabajar** y pulsa **Aplicar**.")
@@ -1935,7 +1938,6 @@ class Empleos(commands.Cog):
         )
         await ctx.send(embed=embed, view=ConfirmarEmpleoView(self.bot, ctx.author.id, empleo))
 
-    @commands.command(name="renunciar")
     async def renunciar(self, ctx):
         _, mensaje = await renunciar_empleo(ctx.author)
         await ctx.send(mensaje)
@@ -1944,7 +1946,6 @@ class Empleos(commands.Cog):
         data = await get_empleo_user(ctx.author.id, force_refresh=True)
         await ctx.send(embed=build_exp_embed(ctx.author, data))
 
-    @commands.command(name="oficina")
     async def oficina(self, ctx):
         data = await get_empleo_user(ctx.author.id, force_refresh=True)
         if not _puede_acceder_oficina(data, ctx.author):
@@ -1954,7 +1955,6 @@ class Empleos(commands.Cog):
             )
         await ctx.reply(view=AbrirOficinaView(ctx.author.id), mention_author=False)
 
-    @commands.command(name="trabajar")
     async def trabajar(self, ctx):
         data = await get_empleo_user(ctx.author.id)
         if not data or not data.get("empleo_actual"):
@@ -2068,6 +2068,9 @@ class JornadaView(ui.View):
                 "❌ Este tablero no es tuyo.",
                 ephemeral=True,
             )
+            return False
+        from bot import check_restricted_interaction
+        if not await check_restricted_interaction(interaction):
             return False
         try:
             await interaction.response.defer()

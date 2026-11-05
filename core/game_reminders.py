@@ -108,6 +108,12 @@ async def send_game_reminder_prompt(interaction: discord.Interaction | None,
                                     user_id: int, game: str,
                                     expires_at: float, *, delay: float = 2) -> None:
     """No afecta la liquidación del juego si Discord o el aviso fallan."""
+    if game != "trabajar":
+        try:
+            from modules.player_panels import notify_game_finished
+            await notify_game_finished(user_id, game, expires_at)
+        except Exception:
+            logger.exception("No se pudo refrescar /jugar tras %s de %s", game, user_id)
     if interaction is None or expires_at <= time.time():
         return
     try:

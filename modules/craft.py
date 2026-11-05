@@ -97,14 +97,17 @@ class CraftConfirmButton(discord.ui.Button):
                 view.notice = reasons.get(result["reason"], "❌ No se pudo completar el canje.")
             view.build()
             try:
-                await interaction.edit_original_response(view=view)
+                if view.message is not None:
+                    await view.message.edit(view=view)
+                else:
+                    await interaction.edit_original_response(view=view)
             except discord.HTTPException:
                 logger.warning("No se pudo refrescar el panel de crafteo de %s", interaction.user.id)
                 await interaction.followup.send(view.notice, ephemeral=True)
 
             if result["ok"] and view.balance_message is not None:
                 try:
-                    embed = view.balance_message.embeds[0]
+                    embed = view.balance_message.embeds[0].copy()
                     embed.set_field_at(
                         2, name=embed.fields[2].name,
                         value=f"{view.balance} {CANDY}", inline=True,
@@ -136,12 +139,13 @@ class CraftNavButton(discord.ui.Button):
 
 class CraftLayout(discord.ui.LayoutView):
     def __init__(self, items: list[dict], owner_id: int, balance: int,
-                 balance_message: discord.Message | None = None):
+                 balance_message: discord.Message | discord.WebhookMessage | None = None):
         super().__init__(timeout=CRAFT_PANEL_SECONDS)
         self.items = items
         self.owner_id = owner_id
         self.balance = balance
         self.balance_message = balance_message
+        self.message: discord.WebhookMessage | None = None
         self.page = 0
         self.pending_item: dict | None = None
         self.notice: str | None = None
@@ -154,6 +158,9 @@ class CraftLayout(discord.ui.LayoutView):
             await interaction.response.send_message(
                 "❌ Este panel no te pertenece.", ephemeral=True,
             )
+            return False
+        from bot import check_player_access
+        if not await check_player_access(interaction):
             return False
         if time.monotonic() >= self.expires_at:
             await interaction.response.send_message(
@@ -224,13 +231,18 @@ class CraftLayout(discord.ui.LayoutView):
             pass
 
 
-async def open_craft_panel(interaction: discord.Interaction):
+async def open_craft_panel(
+    interaction: discord.Interaction,
+    *,
+    balance_message: discord.Message | discord.WebhookMessage | None = None,
+):
     await interaction.response.defer(ephemeral=True)
     try:
         items = await get_craft_items()
         balance = await get_candy_balance(interaction.user.id)
-        view = CraftLayout(items, interaction.user.id, balance, interaction.message)
+        view = CraftLayout(items, interaction.user.id, balance, balance_message)
         message = await interaction.followup.send(view=view, ephemeral=True, wait=True)
+        view.message = message
         asyncio.create_task(view.delete_after_open(message))
     except Exception:
         logger.exception("No se pudo abrir el crafteo de %s", interaction.user.id)
